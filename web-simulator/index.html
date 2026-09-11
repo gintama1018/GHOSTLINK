@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GhostLink — Zero-RF Interactive Protocol System</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="wrap">
+    <header class="app-header">
+      <div class="logo-group">
+        <h1 class="logo-title">GhostLink</h1>
+        <span class="badge zero-rf-badge">ZERO-RF VERIFIED</span>
+      </div>
+      <p class="sub">Local Air-Gapped Transfer Protocol — Light · Sound · Magnetism</p>
+      <div class="channel-tabs">
+        <button class="chbtn active" data-ch="optical" id="btnOptical">
+          <div class="ch-dot optical-dot"></div>
+          <div class="ch-info">
+            <span class="ch-name">Optical Stream</span>
+            <small>screen ⇢ camera · ~1.0–2.5 KB/s</small>
+          </div>
+        </button>
+        <button class="chbtn" data-ch="ultrasonic" id="btnUltrasonic">
+          <div class="ch-dot ultrasonic-dot"></div>
+          <div class="ch-info">
+            <span class="ch-name">Ultrasonic Audio</span>
+            <small>speaker ⇢ mic · ~0.02–0.1 KB/s</small>
+          </div>
+        </button>
+        <button class="chbtn" data-ch="magnetic" id="btnMagnetic">
+          <div class="ch-dot magnetic-dot"></div>
+          <div class="ch-info">
+            <span class="ch-name">Magnetic Contact</span>
+            <small>motor ⇢ magnetometer · 8B Handshake</small>
+          </div>
+        </button>
+      </div>
+    </header>
+
+    <!-- Interactive Dual-Device Transmission Stage -->
+    <div class="stage-card">
+      <div class="stage-header">
+        <span class="stage-title">PHYSICAL TRANSCEIVER STAGE</span>
+        <div class="stage-status" id="stageStatus">State: IDLE (Air-Gap Active)</div>
+      </div>
+
+      <div class="stage-visual">
+        <!-- Phone A: Sender -->
+        <div class="phone-device" id="phoneA">
+          <div class="phone-notch"></div>
+          <div class="phone-screen" id="screenA">
+            <div class="screen-content">
+              <div class="screen-label">SENDER</div>
+              <canvas id="qrCanvas" width="140" height="140"></canvas>
+              <div class="stream-info" id="senderStreamInfo">Awaiting input</div>
+            </div>
+          </div>
+          <div class="device-name">Device A (Tx)</div>
+        </div>
+
+        <!-- Physical Channel Wave / Beam Animation -->
+        <div class="link-bridge" id="linkBridge">
+          <svg id="linkSvg" viewBox="0 0 280 120" preserveAspectRatio="none">
+            <!-- Dynamically populated beams / waves / pulses -->
+          </svg>
+          <div class="channel-telemetry" id="bridgeTelemetry">
+            <span id="telemetryMode">OPTICAL LINK ACTIVE</span>
+            <span id="telemetrySpeed">~1.5 KB/s</span>
+          </div>
+        </div>
+
+        <!-- Phone B: Receiver -->
+        <div class="phone-device" id="phoneB">
+          <div class="phone-notch"></div>
+          <div class="phone-screen" id="screenB">
+            <div class="screen-content">
+              <div class="screen-label">RECEIVER</div>
+              <div class="chunk-matrix" id="chunkMatrix">
+                <!-- 25 visual chunk status blocks -->
+              </div>
+              <div class="stream-info" id="receiverStreamInfo">0 / 0 chunks</div>
+            </div>
+          </div>
+          <div class="device-name">Device B (Rx)</div>
+        </div>
+      </div>
+
+      <!-- Real-time Progress Bar -->
+      <div class="progress-track">
+        <div class="progress-bar" id="progressBar" style="width: 0%;"></div>
+      </div>
+
+      <!-- Protocol Telemetry Bar -->
+      <div class="stats-grid">
+        <div class="stat-card">
+          <span class="stat-label">ACTIVE CHANNEL</span>
+          <span class="stat-value" id="statChannel">Optical (QR Stream)</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">HONEST SPEED</span>
+          <span class="stat-value stat-accent" id="statSpeed">~1.0–2.5 KB/s</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">DATA DELIVERED</span>
+          <span class="stat-value" id="statTransferred">0.0 KB / 0.0 KB</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">TRANSPARENT ETA (F6)</span>
+          <span class="stat-value" id="statEta">Ready</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Interactive Control Deck -->
+    <div class="control-deck">
+      <div class="control-panel">
+        <div class="panel-header">
+          <h3>F7 Encrypted File Transmission</h3>
+          <span class="badge" id="cryptoBadge">AES-GCM-256</span>
+        </div>
+        <div class="form-row">
+          <label for="secretInput">Secret Payload (Plaintext)</label>
+          <textarea id="secretInput" rows="3" placeholder="Enter confidential credentials or message to transmit over Zero-RF...">CONFIDENTIAL MISSION BRIEFING:
+Target: Air-Gapped Lab Node 4
+Status: Physical sensors synchronized
+Payload Integrity: 100% Guaranteed via CRC32
+Zero-RF: Strict Airplane Mode Active (WiFi/BT/Cellular OFF)</textarea>
+        </div>
+
+        <div class="actions-row">
+          <button class="btn btn-primary" id="btnStartTransfer">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+            Execute Zero-RF Transfer
+          </button>
+          <button class="btn btn-secondary" id="btnAudioToggle">
+            <span id="audioToggleIcon">🔊</span>
+            <span id="audioToggleText">Acoustic Audio: Muted</span>
+          </button>
+          <button class="btn btn-ghost" id="btnReset">Reset State</button>
+        </div>
+      </div>
+
+      <!-- Decoded Reassembly Output -->
+      <div class="control-panel">
+        <div class="panel-header">
+          <h3>Reassembled Plaintext (Receiver)</h3>
+          <span class="badge" id="integrityBadge">CRC32 VERIFIED</span>
+        </div>
+        <div class="output-box" id="outputPlaintext">
+          Awaiting reception... Decrypted output will appear here after complete reassembly and AES-GCM authentication.
+        </div>
+        <div class="console-box" id="consoleLog">
+          [System] GhostLink v0.2 Protocol Engine Initialized.
+          [System] All RF radios disabled.
+        </div>
+      </div>
+    </div>
+
+    <!-- Physics & Honesty Footer -->
+    <div class="honest-memo">
+      <h4>Brutal Honesty: The Physics of Zero-RF</h4>
+      <p id="honestMemoText">
+        GhostLink trades RF interception (WiFi/Bluetooth sniffing) for optical line-of-sight and acoustic listening surfaces.
+        <strong>F7 Payload Encryption (AES-GCM-256)</strong> closes this gap so visual or audio recordings yield only ciphertext.
+        Optical achieves ~1.0–2.5 KB/s; Ultrasonic achieves ~0.02–0.1 KB/s (128 KB safety cap); Magnetic contact transfers 8 bytes in ~8–12 seconds.
+      </p>
+    </div>
+  </div>
+
+  <script src="ghostlink-app.js"></script>
+</body>
+</html>

@@ -1,0 +1,134 @@
+GHOSTLINK — ZERO-RF FILE TRANSFER SYSTEM
+IMPLEMENTATION PLAN — v0.1
+
+==================================================
+OVERVIEW
+==================================================
+Build order goes from "cheapest to prove" to "hardest to prove":
+optical channel first (well-trodden, fastest to a working demo),
+magnetic handshake second (the novel/differentiating part),
+ultrasonic third (fallback, similar difficulty to optical),
+then integration + channel manager, then polish.
+
+Total estimated timeline: 7-8 weeks solo, ~4-5 weeks with 2 people.
+(Compress to a hackathon-scale MVP by doing PHASE 1 + PHASE 2 only —
+that alone is demo-able and proves the differentiated idea.)
+
+==================================================
+PHASE 0 — RESEARCH & FEASIBILITY (3-5 days)
+==================================================
+- Confirm magnetometer sampling rate + sensitivity on 2-3 target test
+  phones (Android exposes this easily via Sensor API; iOS is more
+  restricted — check CoreMotion access limits)
+- Confirm vibration motor can be pulsed with fine-grained timing control
+  on target OS (Android: VibrationEffect; iOS: much more limited —
+  flag as a real platform risk)
+- Bench-test: can a magnetometer on Phone B reliably detect a pulse
+  pattern from Phone A's vibration motor at 0-2cm distance?
+- Decide MVP target platform (recommend Android-first given sensor
+  access — note iOS as stretch goal, not v1 promise)
+DELIVERABLE: feasibility memo — go/no-go on magnetic channel
+
+==================================================
+PHASE 1 — OPTICAL CHANNEL MVP (1.5-2 weeks)
+==================================================
+- File chunking: split file into N byte-sized chunks, base64/binary
+  encode each with chunk-index + total-count + checksum header
+  (NOTE: Phase 1 chunks the RAW file, unencrypted — encryption depends
+  on the session key from Phase 2's handshake, which doesn't exist yet.
+  This is fine for a Phase-1 demo, but flag it as demo-only / not secure
+  until Phase 2's encryption task below is wired in.)
+- QR generation: render each chunk as a QR frame, cycle at 2-10 fps
+  (tune for camera capture reliability, not max speed)
+- Receiver: camera feed -> QR frame decode -> chunk buffer ->
+  missing-chunk detection -> request re-display of missed frames
+  (or just loop the full sequence continuously and let receiver
+  grab what it can, simplest MVP approach)
+- Reassembly: sort by chunk-index, verify checksums, write file
+TECH: any mobile-capable QR library (e.g. zxing/qrcode.js equivalents),
+camera access API, basic file I/O
+DELIVERABLE: working screen-to-camera transfer of a small text file
+
+==================================================
+PHASE 2 — MAGNETIC HANDSHAKE (1-1.5 weeks)
+==================================================
+- Define a minimal pulse-pattern encoding (e.g. Manchester-style:
+  pulse duration = bit value) for short tokens (~16-32 bytes: pairing
+  ID, channel-choice byte, session key seed)
+- Transmitter: drive vibration motor in the defined pulse pattern
+- Receiver: sample magnetometer at max rate, run a simple threshold/
+  edge-detection decoder to reconstruct the bit pattern
+- Add basic noise rejection (moving average / debounce window)
+- Derive a session key from the exchanged seed (e.g. HKDF) and encrypt
+  the full file with it (AES-GCM) BEFORE it hits the Chunker from
+  Phase 1 — wire this back into the Phase 1 chunking step so nothing
+  downstream (optical/ultrasonic encoders) ever touches plaintext.
+  This is what makes F7 (Payload Encryption) real instead of a PRD
+  line that never got scheduled.
+DELIVERABLE: two phones touching can exchange a short token reliably
+  across >=10 consecutive trials, AND a file encrypted with that
+  session's derived key round-trips correctly through Phase 1's
+  chunker/reassembly
+
+==================================================
+PHASE 3 — ULTRASONIC FALLBACK (1-1.5 weeks)
+==================================================
+- Choose modulation scheme (FSK: two near-ultrasonic frequencies
+  ~18-20kHz for bit 0/1, kept above typical adult hearing range)
+- Transmitter: generate tone bursts from speaker per bit
+- Receiver: mic capture -> FFT/frequency-bin analysis -> bit decode
+- Same chunking/checksum/reassembly logic as optical channel (reuse
+  Phase 1's data-layer code, only the modulation differs)
+DELIVERABLE: working speaker-to-mic transfer of a small text file
+
+==================================================
+PHASE 4 — ADAPTIVE CHANNEL MANAGER (0.5-1 week)
+==================================================
+- Detection logic: camera available + reasonable light/focus ->
+  prefer optical; else check mic/ambient noise level -> ultrasonic;
+  magnetic always attempted first for handshake regardless
+- Simple state machine: HANDSHAKE -> NEGOTIATE -> TRANSFER -> VERIFY -> DONE
+- Wire all three channels behind one common interface so the app
+  logic doesn't care which physical layer is active
+DELIVERABLE: single app flow that auto-picks a channel and completes
+  a transfer end-to-end
+
+==================================================
+PHASE 5 — INTEGRATION, BENCHMARKING, DEMO POLISH (1 week)
+==================================================
+- Real-device throughput benchmarking per channel (get actual KB/s
+  numbers, don't guess — feed these back into the PRD's honesty section)
+- UI: progress bar, ETA display, channel-in-use indicator
+- Record demo: side-by-side phones actually transferring a file with
+  no WiFi/BT/cellular radios enabled (screen-recorded + radios
+  visibly off, for credibility)
+DELIVERABLE: demo-ready build + benchmark numbers + short video
+
+==================================================
+TECH STACK (suggested)
+==================================================
+- Mobile: Android native (Kotlin) recommended for MVP — best sensor
+  API access (Camera2, SensorManager, Vibrator, AudioRecord)
+- QR: existing open-source encode/decode library, don't build a
+  QR codec from scratch
+- Audio: platform AudioRecord/AudioTrack (or equivalent) for raw
+  PCM access needed for ultrasonic FSK
+- No backend/server needed — this is fully peer-to-peer, local-only
+- Crypto: platform-native AES-GCM (Android: javax.crypto / Tink) +
+  HKDF for session-key derivation — don't roll a custom cipher
+
+==================================================
+KNOWN RISKS TO TRACK
+==================================================
+- iOS vibration motor control is much more restricted than Android —
+  magnetic channel may end up Android-only for v1
+- Magnetometer noise from environment (metal furniture, other
+  electronics) could degrade handshake reliability — needs real-world
+  testing, not just bench testing
+- Optical channel UX (holding phones steady, correct distance) is the
+  most likely source of "it doesn't work" user complaints — budget
+  time for onboarding/alignment guidance UI
+- Encryption (F7) is easy to quietly drop if you're heads-down chasing
+  a working demo — Phase 1 works fine without it, so there's no build
+  error forcing you to add it later. Treat the Phase 2 DELIVERABLE
+  above (encrypted round-trip) as a hard gate, not a nice-to-have.

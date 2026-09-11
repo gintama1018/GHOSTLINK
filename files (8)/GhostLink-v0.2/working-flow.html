@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>GhostLink — Working Sketch</title>
+<style>
+  :root{
+    --bg:#0D1321;
+    --panel:#141C31;
+    --border:#26304C;
+    --border-soft:#1D253E;
+    --text:#E9EDF7;
+    --muted:#7385AC;
+    --optical:#F0A93E;
+    --optical-dim:#4A3A1C;
+    --ultrasonic:#4CD9D0;
+    --ultrasonic-dim:#1C3B38;
+    --magnetic:#B18CFF;
+    --magnetic-dim:#2E2650;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}
+  .wrap{max-width:760px;margin:0 auto;padding:40px 24px 56px;}
+  h1{font-family:Georgia,"Iowan Old Style",serif;font-weight:400;
+    font-size:30px;margin:0 0 6px;letter-spacing:0.2px;}
+  .sub{color:var(--muted);font-size:14px;margin:0 0 34px;
+    font-family:"SF Mono",Consolas,monospace;}
+
+  .channels{display:flex;gap:10px;margin-bottom:28px;}
+  .chbtn{flex:1;padding:12px 8px;border-radius:8px;border:1px solid var(--border);
+    background:var(--panel);color:var(--muted);cursor:pointer;font-size:13px;
+    font-family:"SF Mono",Consolas,monospace;text-align:left;transition:border-color .2s,color .2s;}
+  .chbtn small{display:block;color:var(--muted);font-size:10.5px;margin-top:3px;
+    font-family:-apple-system,sans-serif;}
+  .chbtn.active[data-ch="optical"]{border-color:var(--optical);color:var(--optical);}
+  .chbtn.active[data-ch="ultrasonic"]{border-color:var(--ultrasonic);color:var(--ultrasonic);}
+  .chbtn.active[data-ch="magnetic"]{border-color:var(--magnetic);color:var(--magnetic);}
+
+  .stage{background:var(--panel);border:1px solid var(--border);border-radius:14px;
+    padding:28px 20px;display:flex;align-items:center;justify-content:center;
+    gap:18px;position:relative;min-height:220px;}
+
+  .phone{width:78px;height:150px;border-radius:14px;background:#0A0F1C;
+    border:2px solid var(--border);position:relative;flex-shrink:0;}
+  .phone::after{content:"";position:absolute;left:50%;top:8px;
+    width:22px;height:3px;border-radius:2px;background:var(--border-soft);
+    transform:translateX(-50%);}
+  .phone .screen{position:absolute;inset:14px 6px;border-radius:4px;
+    background:#04070D;overflow:hidden;display:flex;align-items:center;justify-content:center;}
+
+  .link{flex:1;max-width:280px;height:100px;position:relative;}
+  .link svg{width:100%;height:100%;overflow:visible;}
+
+  .qr-grid{display:grid;grid-template-columns:repeat(5,1fr);grid-template-rows:repeat(5,1fr);
+    width:70%;height:70%;gap:2px;}
+  .qr-grid div{background:#0A0F1C;}
+  .qr-grid div.on{background:var(--optical);}
+
+  .stats{display:flex;justify-content:space-between;margin-top:22px;
+    font-family:"SF Mono",Consolas,monospace;font-size:12px;color:var(--muted);
+    border-top:1px solid var(--border-soft);padding-top:16px;}
+  .stats b{color:var(--text);font-weight:600;}
+  .stat-accent{transition:color .2s;}
+
+  .note{margin-top:22px;font-size:12.5px;color:var(--muted);line-height:1.6;
+    border-left:2px solid var(--border);padding-left:12px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>GhostLink — working sketch</h1>
+  <p class="sub">no wifi · no bluetooth · no cellular — pick a channel below</p>
+
+  <div class="channels">
+    <button class="chbtn active" data-ch="optical" onclick="setChannel('optical')">
+      Optical
+      <small>screen → camera</small>
+    </button>
+    <button class="chbtn" data-ch="ultrasonic" onclick="setChannel('ultrasonic')">
+      Ultrasonic
+      <small>speaker → mic</small>
+    </button>
+    <button class="chbtn" data-ch="magnetic" onclick="setChannel('magnetic')">
+      Magnetic
+      <small>motor → magnetometer</small>
+    </button>
+  </div>
+
+  <div class="stage">
+    <div class="phone" id="phoneA"><div class="screen" id="screenA"></div></div>
+    <div class="link"><svg id="linkSvg" viewBox="0 0 280 100"></svg></div>
+    <div class="phone" id="phoneB"><div class="screen" id="screenB"></div></div>
+  </div>
+
+  <div class="stats">
+    <div>channel: <b id="statChannel">optical</b></div>
+    <div>est. speed: <b class="stat-accent" id="statSpeed">~1–20 KB/s</b></div>
+    <div>transferred: <b id="statBits">0 KB</b></div>
+  </div>
+
+  <p class="note" id="honestNote">
+    Simulated at real-world scale. Optical is the primary bulk channel — fast enough for text,
+    keys, and small files; not for video. Numbers here are illustrative, not measured.
+  </p>
+</div>
+
+<script>
+const accentMap = { optical:'#F0A93E', ultrasonic:'#4CD9D0', magnetic:'#B18CFF' };
+const speedMap = {
+  optical: '~1–20 KB/s',
+  ultrasonic: '~0.5–5 KB/s',
+  magnetic: 'bits/s (handshake only)'
+};
+const noteMap = {
+  optical: 'Simulated at real-world scale. Optical is the primary bulk channel — fast enough for text, keys, and small files; not for video.',
+  ultrasonic: "Fallback when screens can't face each other. Slower and more sensitive to ambient noise than optical.",
+  magnetic: 'Not a bulk channel — used for the initial handshake and tiny tokens (pairing ID, session key seed) only.'
+};
+
+let current = 'optical';
+let animId = null;
+let bits = 0;
+
+function setChannel(ch){
+  current = ch;
+  document.querySelectorAll('.chbtn').forEach(b=>b.classList.toggle('active', b.dataset.ch===ch));
+  document.getElementById('statChannel').textContent = ch;
+  document.getElementById('statSpeed').textContent = speedMap[ch];
+  document.getElementById('statSpeed').style.color = accentMap[ch];
+  document.getElementById('honestNote').textContent = noteMap[ch];
+  bits = 0;
+  updateBits();
+  renderStage();
+}
+
+function updateBits(){
+  const rate = current==='optical' ? 0.9 : current==='ultrasonic' ? 0.3 : 0.02;
+  bits += rate;
+  document.getElementById('statBits').textContent = bits.toFixed(1) + ' KB';
+}
+
+function renderStage(){
+  const svg = document.getElementById('linkSvg');
+  const screenA = document.getElementById('screenA');
+  const screenB = document.getElementById('screenB');
+  svg.innerHTML = '';
+  screenA.innerHTML = '';
+  screenB.innerHTML = '';
+
+  if(current === 'optical'){
+    const grid = document.createElement('div');
+    grid.className = 'qr-grid';
+    for(let i=0;i<25;i++){ const c = document.createElement('div'); grid.appendChild(c); }
+    screenA.appendChild(grid);
+    screenA.dataset.cells = 'true';
+
+    for(let i=0;i<5;i++){
+      const line = document.createElementNS('http://www.w3.org/2000/svg','line');
+      line.setAttribute('x1', 10); line.setAttribute('x2', 270);
+      line.setAttribute('y1', 15 + i*17); line.setAttribute('y2', 15 + i*17);
+      line.setAttribute('stroke', accentMap.optical);
+      line.setAttribute('stroke-width', '1.5');
+      line.setAttribute('stroke-dasharray', '3 6');
+      line.setAttribute('opacity', '0.5');
+      svg.appendChild(line);
+    }
+  } else if(current === 'ultrasonic'){
+    const path = document.createElementNS('http://www.w3.org/2000/svg','path');
+    let d = 'M10,50 ';
+    for(let x=10;x<=270;x+=6){ d += `L${x},${50 + Math.sin(x/8)*18} `; }
+    path.setAttribute('d', d);
+    path.setAttribute('stroke', accentMap.ultrasonic);
+    path.setAttribute('fill','none');
+    path.setAttribute('stroke-width','1.5');
+    svg.appendChild(path);
+  } else {
+    for(let i=0;i<3;i++){
+      const circle = document.createElementNS('http://www.w3.org/2000/svg','circle');
+      circle.setAttribute('cx', 140); circle.setAttribute('cy', 50);
+      circle.setAttribute('r', 12 + i*10);
+      circle.setAttribute('stroke', accentMap.magnetic);
+      circle.setAttribute('fill','none');
+      circle.setAttribute('stroke-width','1.2');
+      circle.setAttribute('opacity', 0.6 - i*0.15);
+      svg.appendChild(circle);
+    }
+  }
+}
+
+function tick(){
+  if(current === 'optical'){
+    const cells = document.querySelectorAll('.qr-grid div');
+    cells.forEach(c => { if(Math.random() < 0.35) c.classList.toggle('on'); });
+  } else if(current === 'ultrasonic'){
+    const path = document.querySelector('#linkSvg path');
+    if(path){
+      const offset = (Date.now()/120) % 12;
+      let d = 'M10,50 ';
+      for(let x=10;x<=270;x+=6){ d += `L${x},${50 + Math.sin((x+offset*10)/8)*18} `; }
+      path.setAttribute('d', d);
+    }
+  } else {
+    const circles = document.querySelectorAll('#linkSvg circle');
+    const t = (Date.now()/500) % 3;
+    circles.forEach((c,i)=>{
+      const r = 8 + ((t+i)%3)*14;
+      c.setAttribute('r', r);
+      c.setAttribute('opacity', Math.max(0, 0.6 - r/60));
+    });
+  }
+  updateBits();
+  animId = requestAnimationFrame(tick);
+}
+
+renderStage();
+tick();
+</script>
+</body>
+</html>

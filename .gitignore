@@ -1,0 +1,13 @@
+# Gradle & Android build files
+.gradle/
+build/
+android/app/build/
+android/.gradle/
+bin/
+local.properties
+*.iml
+.idea/
+.DS_Store
+
+# Keep the release APK
+!GhostLink-v0.2.apk

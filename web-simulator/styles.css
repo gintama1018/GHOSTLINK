@@ -1,0 +1,522 @@
+:root {
+  --bg: #0D1321;
+  --panel: #141C31;
+  --panel-elevated: #1A243F;
+  --border: #26304C;
+  --border-soft: #1D253E;
+  --text: #E9EDF7;
+  --muted: #7385AC;
+  --optical: #F0A93E;
+  --optical-dim: #4A3A1C;
+  --ultrasonic: #4CD9D0;
+  --ultrasonic-dim: #1C3B38;
+  --magnetic: #B18CFF;
+  --magnetic-dim: #2E2650;
+  --success: #22C55E;
+  --danger: #EF4444;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background-color: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+  line-height: 1.5;
+  padding: 24px 16px;
+}
+
+.wrap {
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+/* Header */
+.app-header {
+  margin-bottom: 24px;
+}
+
+.logo-group {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+
+.logo-title {
+  font-family: Georgia, "Iowan Old Style", serif;
+  font-weight: 400;
+  font-size: 32px;
+  letter-spacing: 0.5px;
+  color: var(--text);
+}
+
+.badge {
+  font-size: 11px;
+  font-family: "SF Mono", Consolas, monospace;
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+.zero-rf-badge {
+  background: rgba(76, 217, 208, 0.12);
+  color: var(--ultrasonic);
+  border: 1px solid rgba(76, 217, 208, 0.3);
+}
+
+.sub {
+  color: var(--muted);
+  font-size: 13.5px;
+  font-family: "SF Mono", Consolas, monospace;
+  margin-bottom: 18px;
+}
+
+/* Channel Navigation Tabs */
+.channel-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+
+.chbtn {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.2s ease;
+}
+
+.chbtn:hover {
+  border-color: #3B4C78;
+}
+
+.ch-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.optical-dot { background: var(--optical); box-shadow: 0 0 8px var(--optical); }
+.ultrasonic-dot { background: var(--ultrasonic); box-shadow: 0 0 8px var(--ultrasonic); }
+.magnetic-dot { background: var(--magnetic); box-shadow: 0 0 8px var(--magnetic); }
+
+.ch-name {
+  display: block;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.ch-info small {
+  display: block;
+  font-size: 10.5px;
+  color: var(--muted);
+  font-family: "SF Mono", Consolas, monospace;
+  margin-top: 2px;
+}
+
+.chbtn.active[data-ch="optical"] {
+  border-color: var(--optical);
+  background: rgba(240, 169, 62, 0.06);
+}
+.chbtn.active[data-ch="ultrasonic"] {
+  border-color: var(--ultrasonic);
+  background: rgba(76, 217, 208, 0.06);
+}
+.chbtn.active[data-ch="magnetic"] {
+  border-color: var(--magnetic);
+  background: rgba(177, 140, 255, 0.06);
+}
+
+/* Transceiver Stage */
+.stage-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 24px;
+  margin-bottom: 24px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+}
+
+.stage-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+  font-family: "SF Mono", Consolas, monospace;
+  font-size: 11px;
+}
+
+.stage-title {
+  color: var(--muted);
+  letter-spacing: 1px;
+}
+
+.stage-status {
+  color: var(--text);
+  background: var(--border-soft);
+  padding: 4px 10px;
+  border-radius: 4px;
+}
+
+.stage-visual {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 240px;
+  margin-bottom: 20px;
+}
+
+/* Phone Device Mockup */
+.phone-device {
+  width: 140px;
+  height: 240px;
+  border-radius: 20px;
+  background: #090E18;
+  border: 2px solid var(--border);
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 10px 8px;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.4);
+}
+
+.phone-notch {
+  width: 32px;
+  height: 4px;
+  background: var(--border-soft);
+  border-radius: 2px;
+  margin-bottom: 8px;
+}
+
+.phone-screen {
+  flex: 1;
+  width: 100%;
+  background: #04070D;
+  border-radius: 10px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-soft);
+}
+
+.screen-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 6px;
+  text-align: center;
+}
+
+.screen-label {
+  font-size: 9px;
+  font-family: "SF Mono", Consolas, monospace;
+  color: var(--muted);
+  letter-spacing: 1px;
+  margin-bottom: 4px;
+}
+
+#qrCanvas {
+  width: 110px;
+  height: 110px;
+  background: #0A0F1C;
+  border-radius: 4px;
+}
+
+.stream-info {
+  font-size: 9.5px;
+  color: var(--muted);
+  font-family: "SF Mono", Consolas, monospace;
+  margin-top: 6px;
+}
+
+.device-name {
+  font-size: 10px;
+  color: var(--muted);
+  font-family: "SF Mono", Consolas, monospace;
+  margin-top: 6px;
+}
+
+/* Chunk Matrix */
+.chunk-matrix {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  grid-template-rows: repeat(5, 1fr);
+  gap: 3px;
+  width: 110px;
+  height: 110px;
+  background: #0A0F1C;
+  padding: 4px;
+  border-radius: 4px;
+}
+
+.chunk-block {
+  background: #141C31;
+  border-radius: 1px;
+  transition: background 0.15s ease;
+}
+
+.chunk-block.received {
+  background: var(--optical);
+  box-shadow: 0 0 4px var(--optical);
+}
+
+.chunk-block.received-audio {
+  background: var(--ultrasonic);
+  box-shadow: 0 0 4px var(--ultrasonic);
+}
+
+/* Link Bridge SVG & Telemetry */
+.link-bridge {
+  flex: 1;
+  height: 140px;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+}
+
+#linkSvg {
+  width: 100%;
+  height: 90px;
+}
+
+.channel-telemetry {
+  display: flex;
+  gap: 12px;
+  font-family: "SF Mono", Consolas, monospace;
+  font-size: 11px;
+  color: var(--muted);
+  background: rgba(13, 19, 33, 0.7);
+  padding: 3px 10px;
+  border-radius: 12px;
+  border: 1px solid var(--border-soft);
+}
+
+/* Progress Track */
+.progress-track {
+  width: 100%;
+  height: 6px;
+  background: #090E18;
+  border-radius: 3px;
+  overflow: hidden;
+  margin-bottom: 20px;
+}
+
+.progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, var(--optical), #FFA726);
+  border-radius: 3px;
+  transition: width 0.15s ease;
+}
+
+/* Protocol Telemetry Grid */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  border-top: 1px solid var(--border-soft);
+  padding-top: 16px;
+}
+
+.stat-card {
+  display: flex;
+  flex-direction: column;
+}
+
+.stat-label {
+  font-size: 10px;
+  color: var(--muted);
+  font-family: "SF Mono", Consolas, monospace;
+  margin-bottom: 4px;
+}
+
+.stat-value {
+  font-size: 13px;
+  font-family: "SF Mono", Consolas, monospace;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.stat-accent {
+  color: var(--optical);
+  transition: color 0.2s ease;
+}
+
+/* Control Deck */
+.control-deck {
+  display: grid;
+  grid-template-columns: 1.1fr 0.9fr;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.control-panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+}
+
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 14px;
+}
+
+.panel-header h3 {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.panel-header .badge {
+  background: rgba(177, 140, 255, 0.12);
+  color: var(--magnetic);
+  border: 1px solid rgba(177, 140, 255, 0.3);
+}
+
+.form-row {
+  margin-bottom: 14px;
+}
+
+.form-row label {
+  display: block;
+  font-size: 11px;
+  color: var(--muted);
+  font-family: "SF Mono", Consolas, monospace;
+  margin-bottom: 6px;
+}
+
+textarea {
+  width: 100%;
+  background: #090E18;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 10px;
+  font-family: "SF Mono", Consolas, monospace;
+  font-size: 12px;
+  resize: vertical;
+}
+
+textarea:focus {
+  outline: none;
+  border-color: #3B4C78;
+}
+
+.actions-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 14px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: all 0.2s ease;
+}
+
+.btn-primary {
+  background: var(--optical);
+  color: #090E18;
+}
+
+.btn-primary:hover {
+  background: #FFB74D;
+}
+
+.btn-secondary {
+  background: var(--panel-elevated);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.btn-secondary:hover {
+  border-color: #3B4C78;
+}
+
+.btn-ghost {
+  background: transparent;
+  border-color: var(--border-soft);
+  color: var(--muted);
+}
+
+.btn-ghost:hover {
+  color: var(--text);
+}
+
+/* Outputs & Console */
+.output-box {
+  background: #090E18;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  padding: 12px;
+  min-height: 90px;
+  font-family: "SF Mono", Consolas, monospace;
+  font-size: 11.5px;
+  color: #A3B3D4;
+  margin-bottom: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.console-box {
+  background: #05080F;
+  border: 1px solid #131929;
+  border-radius: 6px;
+  padding: 10px;
+  height: 80px;
+  overflow-y: auto;
+  font-family: "SF Mono", Consolas, monospace;
+  font-size: 10px;
+  color: #64748B;
+  line-height: 1.6;
+}
+
+/* Honest Memo */
+.honest-memo {
+  background: rgba(20, 28, 49, 0.6);
+  border-left: 3px solid var(--optical);
+  padding: 14px 16px;
+  border-radius: 0 8px 8px 0;
+}
+
+.honest-memo h4 {
+  font-size: 12px;
+  font-family: "SF Mono", Consolas, monospace;
+  color: var(--optical);
+  margin-bottom: 4px;
+}
+
+.honest-memo p {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.6;
+}
