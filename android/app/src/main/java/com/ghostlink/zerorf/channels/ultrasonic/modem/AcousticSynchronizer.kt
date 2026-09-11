@@ -52,7 +52,7 @@ class AcousticSynchronizer {
                         modeId = (modeId shl 1) or bitBuffer[modeStart + m]
                     }
 
-                    if (modeId in 0..2) {
+                    if (modeId in 0..6) {
                         val payloadStartBit = i + SYNC_TOTAL_BITS
                         return Pair(payloadStartBit, modeId)
                     }

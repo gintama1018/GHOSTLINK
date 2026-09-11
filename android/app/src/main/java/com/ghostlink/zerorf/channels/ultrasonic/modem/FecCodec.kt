@@ -17,6 +17,12 @@ object FecCodec {
         DOUBLE_BIT_UNCORRECTABLE
     }
 
+    enum class FecScheme {
+        RATE_1_2_HAMMING,    // Strict Hamming(8,4) SEC-DED for both header and payload (Robust)
+        RATE_3_4_PARITY,     // Rate-3/4 bit-interleaved parity (Balanced)
+        RATE_PASSTHROUGH     // Direct payload with CRC-32 verification & ARQ (Maximum speed)
+    }
+
     data class NibbleResult(
         val data: Int,
         val status: DecodeStatus
@@ -142,5 +148,98 @@ object FecCodec {
             i += 2
         }
         return FecResult(out, singleBitCorrections, uncorrectableErrors)
+    }
+
+    /**
+     * Encodes a payload according to the selected FecScheme.
+     */
+    fun encodePayload(payload: ByteArray, scheme: FecScheme): ByteArray {
+        return when (scheme) {
+            FecScheme.RATE_1_2_HAMMING -> encodeBytes(payload)
+            FecScheme.RATE_PASSTHROUGH -> payload.copyOf()
+            FecScheme.RATE_3_4_PARITY -> {
+                // Rate 3/4: 3 data bytes + 1 parity byte
+                val fullBlocks = payload.size / 3
+                val remainder = payload.size % 3
+                val outSize = fullBlocks * 4 + (if (remainder > 0) remainder + 1 else 0)
+                val out = ByteArray(outSize)
+                var inIdx = 0
+                var outIdx = 0
+
+                for (b in 0 until fullBlocks) {
+                    val b0 = payload[inIdx++]
+                    val b1 = payload[inIdx++]
+                    val b2 = payload[inIdx++]
+                    val p = (b0.toInt() xor b1.toInt() xor b2.toInt()).toByte()
+                    out[outIdx++] = b0
+                    out[outIdx++] = b1
+                    out[outIdx++] = b2
+                    out[outIdx++] = p
+                }
+
+                if (remainder > 0) {
+                    var p = 0
+                    for (r in 0 until remainder) {
+                        val br = payload[inIdx++]
+                        p = p xor br.toInt()
+                        out[outIdx++] = br
+                    }
+                    out[outIdx] = p.toByte()
+                }
+                out
+            }
+        }
+    }
+
+    /**
+     * Decodes a payload encoded with the given FecScheme and original raw payload length.
+     */
+    fun decodePayload(encoded: ByteArray, originalLength: Int, scheme: FecScheme): FecResult {
+        return when (scheme) {
+            FecScheme.RATE_1_2_HAMMING -> decodeBytes(encoded)
+            FecScheme.RATE_PASSTHROUGH -> {
+                val len = minOf(encoded.size, originalLength)
+                FecResult(encoded.copyOfRange(0, len), 0, 0)
+            }
+            FecScheme.RATE_3_4_PARITY -> {
+                val fullBlocks = originalLength / 3
+                val remainder = originalLength % 3
+                val out = ByteArray(originalLength)
+                var inIdx = 0
+                var outIdx = 0
+                var parityMismatches = 0
+
+                for (b in 0 until fullBlocks) {
+                    if (inIdx + 3 >= encoded.size) break
+                    val b0 = encoded[inIdx++]
+                    val b1 = encoded[inIdx++]
+                    val b2 = encoded[inIdx++]
+                    val p = encoded[inIdx++]
+                    val expectedP = (b0.toInt() xor b1.toInt() xor b2.toInt()).toByte()
+                    if (p != expectedP) {
+                        parityMismatches++
+                    }
+                    out[outIdx++] = b0
+                    out[outIdx++] = b1
+                    out[outIdx++] = b2
+                }
+
+                if (remainder > 0 && inIdx < encoded.size) {
+                    var p = 0
+                    for (r in 0 until remainder) {
+                        if (inIdx < encoded.size) {
+                            val br = encoded[inIdx++]
+                            p = p xor br.toInt()
+                            out[outIdx++] = br
+                        }
+                    }
+                    if (inIdx < encoded.size) {
+                        val expectedP = encoded[inIdx]
+                        if (p.toByte() != expectedP) parityMismatches++
+                    }
+                }
+                FecResult(out, 0, parityMismatches)
+            }
+        }
     }
 }

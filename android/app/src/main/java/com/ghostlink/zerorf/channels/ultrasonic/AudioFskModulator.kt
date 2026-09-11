@@ -28,10 +28,20 @@ class AudioFskModulator(
 
     /**
      * Synthesizes 16-bit PCM samples for a packet under activeMode.
+     * Supports both single-carrier FSK and multi-carrier OFDM synthesis.
      */
     fun synthesizePcm(packet: Packet): ShortArray {
         val frameBytes = AcousticFramer.framePacket(packet, activeMode)
         val mode = activeMode
+
+        if (mode.isMultiCarrier) {
+            return synthesizeOfdmPcm(frameBytes, mode)
+        } else {
+            return synthesizeFskPcm(frameBytes, mode)
+        }
+    }
+
+    private fun synthesizeFskPcm(frameBytes: ByteArray, mode: AcousticMode): ShortArray {
         val symbolDurationMs = mode.symbolDurationMs
         val samplesPerSymbol = (SAMPLE_RATE * symbolDurationMs) / 1000
         val rampSamples = (SAMPLE_RATE * RAMP_DURATION_MS / 1000).toInt()
@@ -46,7 +56,6 @@ class AudioFskModulator(
         var sampleIdx = 0
         var phase = 0.0
 
-        // Extract symbols (bitsPerSymbol bits per step)
         var bitOffset = 0
         for (sIdx in 0 until totalSymbols) {
             var symbolValue = 0
@@ -84,6 +93,34 @@ class AudioFskModulator(
         return pcm
     }
 
+    private fun synthesizeOfdmPcm(frameBytes: ByteArray, mode: AcousticMode): ShortArray {
+        val phy = com.ghostlink.zerorf.channels.ultrasonic.modem.AcousticMultiCarrierPhy(mode)
+        val bitList = ArrayList<Int>(frameBytes.size * 8)
+        for (b in frameBytes) {
+            val v = b.toInt() and 0xFF
+            for (i in 7 downTo 0) {
+                bitList.add((v shr i) and 1)
+            }
+        }
+
+        val bitsPerOfdm = phy.bitsPerOfdmSymbol
+        val totalOfdmSymbols = (bitList.size + bitsPerOfdm - 1) / bitsPerOfdm
+        val totalSamples = totalOfdmSymbols * phy.totalSymbolSamples
+        val pcm = ShortArray(totalSamples)
+
+        var pcmOffset = 0
+        var bitOffset = 0
+        for (symIdx in 0 until totalOfdmSymbols) {
+            val complexSymbols = phy.mapBitsToSymbols(bitList, bitOffset)
+            bitOffset += bitsPerOfdm
+
+            val ofdmSamples = phy.synthesizeOfdmSymbol(complexSymbols)
+            System.arraycopy(ofdmSamples, 0, pcm, pcmOffset, ofdmSamples.size)
+            pcmOffset += ofdmSamples.size
+        }
+        return pcm
+    }
+
     @Synchronized
     private fun getOrCreateAudioTrack(minPcmSize: Int): AudioTrack {
         val existing = audioTrack
@@ -96,7 +133,7 @@ class AudioFskModulator(
             AudioFormat.CHANNEL_OUT_MONO,
             AudioFormat.ENCODING_PCM_16BIT
         )
-        val bufferSize = maxOf(minBufferSize, minPcmSize * 2)
+        val bufferSize = maxOf(minBufferSize, minPcmSize * 4)
 
         val track = AudioTrack.Builder()
             .setAudioAttributes(
@@ -122,21 +159,25 @@ class AudioFskModulator(
     }
 
     /**
-     * Plays tone burst synchronously and yields execution until the frame completes.
+     * Streams a packet into the active AudioTrack buffer without introducing dead silence.
+     * AudioTrack in MODE_STREAM buffers samples and plays them seamlessly back-to-back.
      */
-    fun playPacket(packet: Packet) {
+    fun streamPacket(packet: Packet) {
         val pcm = synthesizePcm(packet)
         isPlaying = true
 
         try {
             val track = getOrCreateAudioTrack(pcm.size)
+            // Blocking write into audio track hardware buffer - no artificial Thread.sleep!
             track.write(pcm, 0, pcm.size)
-
-            val durationMs = (pcm.size * 1000L) / SAMPLE_RATE
-            Thread.sleep(durationMs + 100L) // Packet duration + 100ms guard interval
-        } catch (_: InterruptedException) {
-            // Cancelled
         } catch (_: Exception) {}
+    }
+
+    /**
+     * Backwards-compatible synchronous packet player without the artificial 100ms sleep.
+     */
+    fun playPacket(packet: Packet) {
+        streamPacket(packet)
     }
 
     fun stop() {

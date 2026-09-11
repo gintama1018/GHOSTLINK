@@ -511,9 +511,12 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
             while (isTransmitting && currentBulkChannel == ChannelManager.BulkChannel.ULTRASONIC) {
                 val packet = channelManager.getNextOutboundPacket() ?: break
                 handler.post {
-                    statusText.text = "Playing Ultrasonic Tone Burst #${packet.chunkIndex + 1}/${packet.totalChunks} (~8.5 B/s)..."
+                    val modeDesc = audioModulator.activeMode.description
+                    val speedBps = audioModulator.activeMode.nominalBps
+                    val speedStr = if (speedBps >= 1000.0) "%.1f KB/s".format(speedBps / 8000.0) else "%.1f B/s".format(speedBps / 8.0)
+                    statusText.text = "Streaming Acoustic Packet #${packet.chunkIndex + 1}/${packet.totalChunks} [$modeDesc ~ $speedStr]..."
                 }
-                audioModulator.playPacket(packet)
+                audioModulator.streamPacket(packet)
             }
         }.start()
     }

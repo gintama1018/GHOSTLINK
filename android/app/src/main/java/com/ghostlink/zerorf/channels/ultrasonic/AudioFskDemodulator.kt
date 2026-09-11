@@ -100,6 +100,9 @@ class AudioFskDemodulator(
                         lowSnrStartTimeMs = 0L
                     }
                 }
+                else -> {
+                    // Multi-carrier OFDM modes (Modes 3, 4, 5, 6) operate under direct PHY selection
+                }
             }
         }
     }
@@ -266,9 +269,9 @@ class AudioFskDemodulator(
             return
         }
 
-        val (payloadStartBit, _) = syncResult
+        val (payloadStartBit, rxModeId) = syncResult
 
-        // 24-byte wire header is encoded with Hamming(8,4) into 48 bytes (384 bits)
+        // 24-byte wire header is ALWAYS encoded with Hamming(8,4) into 48 bytes (384 bits)
         val encodedHeaderBits = Packet.HEADER_SIZE * 2 * 8 // 384 bits
         if (bitBuffer.size < payloadStartBit + encodedHeaderBits) return
 
@@ -290,23 +293,37 @@ class AudioFskDemodulator(
             return
         }
 
-        val totalEncodedBytes = (Packet.HEADER_SIZE + pLen) * 2
-        val totalExpectedBits = totalEncodedBytes * 8
+        val isMultiCarrier = rxModeId >= 3
+        val encodedPayloadBytesCount = if (isMultiCarrier) pLen else pLen * 2
+        val totalExpectedBits = encodedHeaderBits + encodedPayloadBytesCount * 8
 
         if (bitBuffer.size >= payloadStartBit + totalExpectedBits) {
-            val fullEncodedBytes = extractBytes(payloadStartBit, totalEncodedBytes)
-            if (fullEncodedBytes != null) {
-                val fullFec = FecCodec.decodeBytes(fullEncodedBytes)
-                onFecTelemetry?.invoke(fullFec.singleBitCorrections, fullFec.uncorrectableErrors)
+            val payloadStartBitIdx = payloadStartBit + encodedHeaderBits
+            val payloadEncodedBytes = extractBytes(payloadStartBitIdx, encodedPayloadBytesCount)
 
-                if (!fullFec.isClean) {
-                    // Double bit error detected: do not trust, discard corrupted packet
+            if (payloadEncodedBytes != null) {
+                val payloadFec = if (isMultiCarrier) {
+                    FecCodec.decodePayload(payloadEncodedBytes, pLen, FecCodec.FecScheme.RATE_PASSTHROUGH)
+                } else {
+                    FecCodec.decodeBytes(payloadEncodedBytes)
+                }
+
+                val totalFixes = headerFec.singleBitCorrections + payloadFec.singleBitCorrections
+                val totalErrors = headerFec.uncorrectableErrors + payloadFec.uncorrectableErrors
+                onFecTelemetry?.invoke(totalFixes, totalErrors)
+
+                if (!payloadFec.isClean) {
+                    // Double bit or uncorrectable error: discard
                     bitBuffer.subList(0, payloadStartBit).clear()
                     return
                 }
 
                 try {
-                    val packet = Packet.deserialize(fullFec.decodedBytes)
+                    val fullWireBytes = ByteArray(Packet.HEADER_SIZE + pLen)
+                    System.arraycopy(decodedHeader, 0, fullWireBytes, 0, Packet.HEADER_SIZE)
+                    System.arraycopy(payloadFec.decodedBytes, 0, fullWireBytes, Packet.HEADER_SIZE, pLen)
+
+                    val packet = Packet.deserialize(fullWireBytes)
                     onPacketDecoded(packet)
                     val removeUpTo = minOf(bitBuffer.size, payloadStartBit + totalExpectedBits)
                     bitBuffer.subList(0, removeUpTo).clear()

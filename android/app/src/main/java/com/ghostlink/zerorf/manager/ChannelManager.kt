@@ -58,6 +58,8 @@ class ChannelManager(
     var peerPublicKey: java.security.PublicKey? = null
         private set
 
+    var acousticChunkSize: Int = ProtocolConstants.ACOUSTIC_CHUNK_SIZE_STREAM
+
     var securityLevel: CryptoEngine.SecurityLevel = CryptoEngine.SecurityLevel.UNAUTHENTICATED_ECDH
         private set
 
@@ -156,7 +158,7 @@ class ChannelManager(
         // 8. Split ciphertext into chunks based on physical channel
         val chunkSize = when (channel) {
             BulkChannel.OPTICAL -> ProtocolConstants.OPTICAL_CHUNK_SIZE
-            BulkChannel.ULTRASONIC -> ProtocolConstants.ACOUSTIC_CHUNK_SIZE
+            BulkChannel.ULTRASONIC -> acousticChunkSize
         }
 
         val rawPackets = Chunker.chunk(ciphertext, chunkSize, channel == BulkChannel.ULTRASONIC)

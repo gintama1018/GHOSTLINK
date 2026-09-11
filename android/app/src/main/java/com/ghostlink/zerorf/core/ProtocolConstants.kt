@@ -19,8 +19,12 @@ object ProtocolConstants {
 
     // Physical default chunk sizes
     const val OPTICAL_CHUNK_SIZE = 250 // Balanced for QR Version 10 Level-L
-    const val ACOUSTIC_CHUNK_SIZE = 32 // Balanced for ultrasonic packet duration
-    const val ACOUSTIC_MAX_FILE_SIZE = 128 * 1024 // 128 KB acoustic safety cap
+    const val ACOUSTIC_CHUNK_SIZE = 32 // Legacy default
+    const val ACOUSTIC_CHUNK_SIZE_ROBUST = 32 // Robust handshake & poor SNR mode
+    const val ACOUSTIC_CHUNK_SIZE_FAST = 128 // Fast single-carrier mode
+    const val ACOUSTIC_CHUNK_SIZE_STREAM = 256 // High-speed multi-carrier streaming mode
+    const val ACOUSTIC_CHUNK_SIZE_TURBO = 512 // Burst mode for high-SNR transfer
+    const val ACOUSTIC_MAX_FILE_SIZE = 512 * 1024 // 512 KB acoustic safety cap
 
     // Packet Flags
     const val FLAG_DATA: Byte = 0x00
