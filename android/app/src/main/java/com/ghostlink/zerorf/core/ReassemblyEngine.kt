@@ -10,7 +10,8 @@ import java.util.BitSet
 class ReassemblyEngine(val totalChunks: Long) {
     private val chunkStore = arrayOfNulls<ByteArray>(totalChunks.toInt())
     private val receivedBitmap = BitSet(totalChunks.toInt())
-    private var receivedCount = 0
+    var receivedCount = 0
+        private set
 
     val progressFraction: Float
         get() = if (totalChunks > 0) receivedCount.toFloat() / totalChunks else 0f

@@ -484,7 +484,7 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
                     qrBitmapCache[packet.chunkIndex] = bitmap
                 }
                 qrImageView.setImageBitmap(bitmap)
-                statusText.text = "Broadcasting QR Chunk ${packet.chunkIndex + 1}/${packet.totalChunks}"
+                statusText.text = "Broadcasting QR Chunk ${packet.chunkIndex + 1}/${packet.totalChunks} (Continuous Carousel)"
             }
         } catch (e: Exception) {
             log("Render error: ${e.message}")
@@ -508,6 +508,10 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
 
     private fun startReceiveFlow() {
         try {
+            if (isReceiving && channelManager.currentState == ChannelManager.State.TRANSFER) {
+                // Already in active receive mode, protect in-progress chunks!
+                return
+            }
             isTransmitting = false
             isReceiving = true
             stageLabel.visibility = View.GONE
@@ -623,7 +627,7 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
         log("$newState: $message")
     }
 
-    override fun onProgressUpdate(fraction: Float, speedBps: Double) {
+    override fun onProgressUpdate(fraction: Float, speedBps: Double, receivedChunks: Int, totalChunks: Long) {
         val percent = (fraction * 100).toInt()
         progressBar.progress = percent
         if (speedBps >= 100.0) {
@@ -632,7 +636,7 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
         } else {
             etaText.text = "Progress: $percent% (${speedBps.format(1)} B/s acoustic fallback)"
         }
-        statusText.text = "Receiving chunks: $percent% complete"
+        statusText.text = "Receiving chunks: $receivedChunks/$totalChunks ($percent%)"
     }
 
     override fun onFileReady(fileName: String, fileBytes: ByteArray) {

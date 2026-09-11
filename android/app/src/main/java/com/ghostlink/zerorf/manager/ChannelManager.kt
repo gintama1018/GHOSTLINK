@@ -34,7 +34,7 @@ class ChannelManager(
 
     interface ChannelEventListener {
         fun onStateChanged(newState: State, message: String)
-        fun onProgressUpdate(fraction: Float, speedBps: Double)
+        fun onProgressUpdate(fraction: Float, speedBps: Double, receivedChunks: Int, totalChunks: Long)
         fun onFileReady(fileName: String, fileBytes: ByteArray)
         fun onError(error: String)
     }
@@ -160,9 +160,12 @@ class ChannelManager(
         }
 
         // Initialize reassembly engine if needed
-        if (reassemblyEngine == null || reassemblyEngine!!.totalChunks != packet.totalChunks) {
+        if (reassemblyEngine == null) {
             reassemblyEngine = ReassemblyEngine(packet.totalChunks)
-            setState(State.TRANSFER, "Receiving chunks: ${packet.chunkIndex + 1}/${packet.totalChunks}")
+            setState(State.TRANSFER, "Receiving chunks: 0/${packet.totalChunks} (0%)")
+        } else if (reassemblyEngine!!.totalChunks != packet.totalChunks) {
+            // Mismatched totalChunks from foreign or stale stream — do NOT discard in-progress chunks!
+            return
         }
 
         val engine = reassemblyEngine!!
@@ -201,7 +204,7 @@ class ChannelManager(
                 BulkChannel.OPTICAL -> TransparentEta.OPTICAL_BYTE_RATE
                 BulkChannel.ULTRASONIC -> TransparentEta.ULTRASONIC_BYTE_RATE
             }
-            listener.onProgressUpdate(engine.progressFraction, speed)
+            listener.onProgressUpdate(engine.progressFraction, speed, engine.receivedCount, engine.totalChunks)
         }
 
         if (engine.isComplete) {
