@@ -448,6 +448,14 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
                 ChannelManager.BulkChannel.ULTRASONIC -> {
                     qrImageView.visibility = View.GONE
                     scopeView.visibility = View.VISIBLE
+                    try {
+                        val audioManager = getSystemService(android.content.Context.AUDIO_SERVICE) as android.media.AudioManager
+                        val currentVol = audioManager.getStreamVolume(android.media.AudioManager.STREAM_MUSIC)
+                        val maxVol = audioManager.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)
+                        if (currentVol < maxVol * 0.4) {
+                            Toast.makeText(this, "Tip: Set Media Volume to 80-100% for acoustic transfer", Toast.LENGTH_SHORT).show()
+                        }
+                    } catch (_: Exception) {}
                     startAcousticBroadcastLoop()
                 }
             }
@@ -486,7 +494,6 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
                     statusText.text = "Playing Ultrasonic Tone Burst #${packet.chunkIndex + 1}/${packet.totalChunks} (~8.5 B/s)..."
                 }
                 audioModulator.playPacket(packet)
-                Thread.sleep(60)
             }
         }.start()
     }
