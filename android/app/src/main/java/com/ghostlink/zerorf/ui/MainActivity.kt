@@ -30,13 +30,6 @@ import java.util.concurrent.Executors
 
 /**
  * High-aesthetic Dark UI for GhostLink Zero-RF Transfer.
- * Visual palette:
- * - Background: #0D1321
- * - Panel: #141C31
- * - Border: #26304C
- * - Optical: #F0A93E (Amber)
- * - Ultrasonic: #4CD9D0 (Cyan)
- * - Magnetic: #B18CFF (Violet)
  */
 class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
 
@@ -65,32 +58,35 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        channelManager = ChannelManager(this)
-        cameraExecutor = Executors.newSingleThreadExecutor()
+        try {
+            channelManager = ChannelManager(this)
+            cameraExecutor = Executors.newSingleThreadExecutor()
 
-        vibrationTransmitter = VibrationTransmitter(this)
-        magnetometerReceiver = MagnetometerReceiver(this) { packet ->
-            handler.post {
-                log("Magnetic handshake detected! VerCaps: ${packet.verCaps}")
-                channelManager.onMagneticHandshakeReceived(packet)
+            vibrationTransmitter = VibrationTransmitter(this)
+            magnetometerReceiver = MagnetometerReceiver(this) { packet ->
+                handler.post {
+                    log("Magnetic handshake detected! VerCaps: ${packet.verCaps}")
+                    channelManager.onMagneticHandshakeReceived(packet)
+                }
             }
-        }
-        audioModulator = AudioFskModulator()
-        audioDemodulator = AudioFskDemodulator { packet ->
-            handler.post {
-                channelManager.onPacketReceived(packet)
+            audioModulator = AudioFskModulator()
+            audioDemodulator = AudioFskDemodulator { packet ->
+                handler.post {
+                    channelManager.onPacketReceived(packet)
+                }
             }
-        }
 
-        checkPermissions()
-        setupUI()
+            setupUI()
+            checkPermissions()
+        } catch (e: Exception) {
+            Toast.makeText(this, "Init error: ${e.message}", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun checkPermissions() {
         val permissions = arrayOf(
             android.Manifest.permission.CAMERA,
-            android.Manifest.permission.RECORD_AUDIO,
-            android.Manifest.permission.VIBRATE
+            android.Manifest.permission.RECORD_AUDIO
         )
         val missing = permissions.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
@@ -235,54 +231,77 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
     }
 
     private fun startSendFlow() {
-        stopCamera()
-        stageLabel.visibility = View.GONE
-        previewView.visibility = View.GONE
-        qrImageView.visibility = View.VISIBLE
+        try {
+            stopCamera()
+            stageLabel.visibility = View.GONE
+            previewView.visibility = View.GONE
+            qrImageView.visibility = View.VISIBLE
 
-        log("Generating 10 KB test payload...")
-        val testPayload = ByteArray(10240) { (it and 0xFF).toByte() }
+            log("Generating 10 KB test payload...")
+            val testPayload = ByteArray(10240) { (it and 0xFF).toByte() }
 
-        // Calculate and show transparent ETA (F6)
-        val opticalEta = TransparentEta.calculateOpticalEta(testPayload.size.toLong())
-        etaText.text = "ETA: ${opticalEta.formattedTime} (Optical ${opticalEta.speedDescription})"
+            // Calculate and show transparent ETA (F6)
+            val opticalEta = TransparentEta.calculateOpticalEta(testPayload.size.toLong())
+            etaText.text = "ETA: ${opticalEta.formattedTime} (Optical ${opticalEta.speedDescription})"
 
-        // Start channel manager sender pipeline (Generates seed, encrypts via AES-GCM, chunks)
-        channelManager.startSender(testPayload)
+            // Start channel manager sender pipeline
+            channelManager.startSender(testPayload)
 
-        // Transmit 8-byte magnetic handshake pulse via vibration motor
-        val hsPacket = MagneticPacket.create(0x11, ChannelManager.DEFAULT_SEED)
-        log("Transmitting magnetic handshake pulse (contact <2cm)...")
-        vibrationTransmitter.transmit(hsPacket)
+            // Transmit 8-byte magnetic handshake pulse via vibration motor
+            val hsPacket = MagneticPacket.create(0x11, ChannelManager.DEFAULT_SEED)
+            log("Transmitting magnetic handshake pulse (contact <2cm)...")
+            vibrationTransmitter.transmit(hsPacket)
 
-        // Start Optical QR frame loop at 6 FPS
-        isTransmittingQr = true
-        startQrCarouselLoop()
+            // Start Optical QR frame loop at 6 FPS
+            isTransmittingQr = true
+            startQrCarouselLoop()
+        } catch (e: Exception) {
+            log("Send error: ${e.message}")
+        }
     }
 
     private fun startQrCarouselLoop() {
         if (!isTransmittingQr) return
-        val packet = channelManager.getNextOutboundPacket()
-        if (packet != null) {
-            val bitmap = QrFrameEncoder.encodePacketToBitmap(packet, 500)
-            qrImageView.setImageBitmap(bitmap)
-            statusText.text = "Streaming QR Chunk ${packet.chunkIndex + 1}/${packet.totalChunks}"
+        try {
+            val packet = channelManager.getNextOutboundPacket()
+            if (packet != null) {
+                val bitmap = QrFrameEncoder.encodePacketToBitmap(packet, 500)
+                qrImageView.setImageBitmap(bitmap)
+                statusText.text = "Streaming QR Chunk ${packet.chunkIndex + 1}/${packet.totalChunks}"
+            }
+        } catch (e: Exception) {
+            log("Frame render error: ${e.message}")
         }
         // 6 FPS = ~166 ms per frame
         handler.postDelayed({ startQrCarouselLoop() }, 166)
     }
 
     private fun startReceiveFlow() {
-        isTransmittingQr = false
-        stageLabel.visibility = View.GONE
-        qrImageView.visibility = View.GONE
-        previewView.visibility = View.VISIBLE
+        try {
+            isTransmittingQr = false
+            stageLabel.visibility = View.GONE
+            qrImageView.visibility = View.GONE
+            previewView.visibility = View.VISIBLE
 
-        log("Entering Receive Mode. Starting Camera Scanner, Magnetometer, & Mic...")
-        channelManager.startReceiver()
-        magnetometerReceiver.startListening()
-        audioDemodulator.startListening()
-        startCameraScanner()
+            log("Entering Receive Mode. Starting Camera Scanner, Magnetometer, & Mic...")
+            channelManager.startReceiver()
+            magnetometerReceiver.startListening()
+
+            if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                audioDemodulator.startListening()
+            } else {
+                log("Audio permission not granted yet, proceeding with Optical.")
+            }
+
+            if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                startCameraScanner()
+            } else {
+                log("Camera permission not granted yet, requesting...")
+                ActivityCompat.requestPermissions(this, arrayOf(android.Manifest.permission.CAMERA), 101)
+            }
+        } catch (e: Exception) {
+            log("Receive start error: ${e.message}")
+        }
     }
 
     private fun startCameraScanner() {
@@ -323,7 +342,22 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
     }
 
     private fun log(msg: String) {
-        logView.append("$msg\n")
+        handler.post {
+            logView.append("$msg\n")
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 101) {
+            for (i in permissions.indices) {
+                if (permissions[i] == android.Manifest.permission.CAMERA && grantResults[i] == PackageManager.PERMISSION_GRANTED) {
+                    if (previewView.visibility == View.VISIBLE) {
+                        startCameraScanner()
+                    }
+                }
+            }
+        }
     }
 
     // --- Channel Manager Callbacks ---
@@ -356,10 +390,12 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
         super.onDestroy()
         isTransmittingQr = false
         stopCamera()
-        cameraExecutor.shutdown()
-        vibrationTransmitter.stop()
-        magnetometerReceiver.stopListening()
-        audioModulator.stop()
-        audioDemodulator.stopListening()
+        try {
+            cameraExecutor.shutdown()
+            vibrationTransmitter.stop()
+            magnetometerReceiver.stopListening()
+            audioModulator.stop()
+            audioDemodulator.stopListening()
+        } catch (_: Exception) {}
     }
 }

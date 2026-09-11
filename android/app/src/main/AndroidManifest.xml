@@ -9,7 +9,7 @@
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
-    <uses-feature android:name="android.hardware.sensor.compass" android:required="true" />
+    <uses-feature android:name="android.hardware.sensor.compass" android:required="false" />
     <uses-feature android:name="android.hardware.microphone" android:required="true" />
 
     <application
@@ -18,7 +18,7 @@
         android:label="GhostLink"
         android:roundIcon="@android:drawable/ic_dialog_info"
         android:supportsRtl="true"
-        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+        android:theme="@style/Theme.AppCompat.NoActionBar">
         <activity
             android:name=".ui.MainActivity"
             android:exported="true"
