@@ -222,6 +222,14 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
         tabLayout.addView(tabAcoustic)
         root.addView(tabLayout)
 
+        val channelHint = TextView(this).apply {
+            text = "💡 Optical QR is PRIMARY for files/images (~2.5 KB/s). Ultrasonic is for small secrets (~8.5 B/s)."
+            textSize = 10.5f
+            setTextColor(Color.parseColor("#94A3B8"))
+            setPadding(0, 0, 0, 10)
+        }
+        root.addView(channelHint)
+
         // Handshake Status Indicator
         handshakeBadge = TextView(this).apply {
             text = "HANDSHAKE: READY (Touch for Magnetometer / Auto via Stream)"
@@ -481,8 +489,8 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
         } catch (e: Exception) {
             log("Render error: ${e.message}")
         }
-        // 8 FPS = 125 ms interval (~2.0 KB/s transfer rate)
-        handler.postDelayed({ startQrCarouselLoop() }, 125)
+        // 10 FPS = 100 ms interval (~2.5 KB/s transfer rate)
+        handler.postDelayed({ startQrCarouselLoop() }, 100)
     }
 
     private fun startAcousticBroadcastLoop() {
@@ -618,8 +626,12 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
     override fun onProgressUpdate(fraction: Float, speedBps: Double) {
         val percent = (fraction * 100).toInt()
         progressBar.progress = percent
-        val kbps = speedBps / 1024.0
-        etaText.text = "Progress: $percent% (${speedBps.format(1)} B/s · ${kbps.format(2)} KB/s)"
+        if (speedBps >= 100.0) {
+            val kbps = speedBps / 1024.0
+            etaText.text = "Progress: $percent% (${kbps.format(1)} KB/s sustained)"
+        } else {
+            etaText.text = "Progress: $percent% (${speedBps.format(1)} B/s acoustic fallback)"
+        }
         statusText.text = "Receiving chunks: $percent% complete"
     }
 

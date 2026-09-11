@@ -9,10 +9,10 @@ import kotlin.math.roundToInt
  * - Ultrasonic (BFSK 18.5/19.5 kHz @ 15ms/symbol): ~8.5 B/s sustained
  */
 object TransparentEta {
-    const val OPTICAL_BYTE_RATE = 1500.0 // B/s sustained (~1.5 KB/s)
+    const val OPTICAL_BYTE_RATE = 2500.0 // B/s sustained (~2.5 KB/s at 10 FPS)
     const val OPTICAL_REDUNDANCY = 1.25
 
-    const val ULTRASONIC_BYTE_RATE = 8.5 // B/s actual BFSK throughput (15ms symbol = 67 bps = 8.375 B/s)
+    const val ULTRASONIC_BYTE_RATE = 8.5 // B/s actual physical BFSK throughput (15ms symbol = 67 bps = 8.375 B/s)
     const val ULTRASONIC_REDUNDANCY = 1.30
     const val ULTRASONIC_MAX_BYTES = 128 * 1024 // 128 KB safety cap
 
@@ -36,7 +36,7 @@ object TransparentEta {
             durationSeconds = seconds,
             isAllowed = true,
             formattedTime = formatDuration(seconds),
-            speedDescription = "~1.0–2.5 KB/s (Optical)"
+            speedDescription = "~2.5 KB/s (High-Speed Optical QR)"
         )
     }
 
