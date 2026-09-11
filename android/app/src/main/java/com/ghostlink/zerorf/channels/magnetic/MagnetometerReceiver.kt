@@ -9,29 +9,26 @@ import kotlin.math.sqrt
 
 /**
  * MagnetometerReceiver listens to the phone's magnetometer at SENSOR_DELAY_FASTEST (~50-100Hz),
- * cancels baseline drift, detects pulse edges via Schmitt trigger hysteresis,
- * and decodes the 8-byte MagneticPacket.
+ * cancels baseline drift, feeds live scope telemetry, and decodes the 8-byte MagneticPacket.
  */
 class MagnetometerReceiver(
-    private val context: Context,
+    context: Context,
+    private val onSampleUpdate: ((rawMag: Float, delta: Float) -> Unit)? = null,
     private val onPacketReceived: (MagneticPacket) -> Unit
 ) : SensorEventListener {
 
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     private val magnetometer = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
 
-    // Signal processing states
     private var lastRawMagnitude = 0.0
     private var filteredValue = 0.0
-    private val alpha = 0.85 // High-pass baseline cancellation factor
+    private val alpha = 0.85
 
-    // Schmitt trigger hysteresis thresholds (in microTesla above baseline)
-    private val highThreshold = 6.0 // uT
-    private val lowThreshold = 2.5  // uT
+    private val highThreshold = 5.0
+    private val lowThreshold = 2.0
     private var isHigh = false
     private var pulseStartTimeMs = 0L
 
-    // Bit decoding state
     private val receivedBits = ArrayList<Int>()
     private var listening = false
 
@@ -61,28 +58,22 @@ class MagnetometerReceiver(
             return
         }
 
-        // High-pass filter: y[n] = alpha * (y[n-1] + x[n] - x[n-1])
         filteredValue = alpha * (filteredValue + rawMag - lastRawMagnitude)
         lastRawMagnitude = rawMag
 
-        val currentTimeMs = System.currentTimeMillis()
-        val absDelta = Math.abs(filteredValue)
+        val absDelta = Math.abs(filteredValue).toFloat()
+        onSampleUpdate?.invoke(rawMag.toFloat(), absDelta)
 
-        // Schmitt trigger
+        val currentTimeMs = System.currentTimeMillis()
+
         if (!isHigh && absDelta >= highThreshold) {
-            // Rising edge (pulse start)
             isHigh = true
             pulseStartTimeMs = currentTimeMs
         } else if (isHigh && absDelta <= lowThreshold) {
-            // Falling edge (pulse end)
             isHigh = false
             val pulseDuration = currentTimeMs - pulseStartTimeMs
 
-            // Ignore spurious glitch pulses < 35ms
             if (pulseDuration >= 35) {
-                // Classify bit duration:
-                // Nominal bit 0 is 60ms (accept 35ms to 85ms)
-                // Nominal bit 1 is 120ms (accept 86ms to 180ms)
                 val bit = if (pulseDuration > 85) 1 else 0
                 handleDecodedBit(bit)
             }
@@ -91,10 +82,7 @@ class MagnetometerReceiver(
 
     private fun handleDecodedBit(bit: Int) {
         receivedBits.add(bit)
-
-        // Check if we have received a multiple of 8 bits and at least 64 bits (8 bytes)
         if (receivedBits.size >= 64) {
-            // Look for sync byte 0xA5 (10100101b) in the stream
             val syncBits = listOf(1, 0, 1, 0, 0, 1, 0, 1)
             val syncIdx = findSubsequence(receivedBits, syncBits)
 
@@ -113,8 +101,7 @@ class MagnetometerReceiver(
                     val packet = MagneticPacket.deserialize(bytes)
                     onPacketReceived(packet)
                     receivedBits.clear()
-                } catch (e: Exception) {
-                    // CRC failed or noise, drop candidate sync and keep scanning
+                } catch (_: Exception) {
                     receivedBits.removeAt(syncIdx)
                 }
             }

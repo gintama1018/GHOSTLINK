@@ -8,28 +8,34 @@ import kotlin.math.PI
 import kotlin.math.cos
 
 /**
- * AudioFskDemodulator captures PCM audio from the microphone and applies
- * Goertzel filter energy detection at 18,500 Hz (Space) and 19,500 Hz (Mark).
+ * AudioFskDemodulator captures PCM audio and applies Goertzel frequency energy detection.
  */
 class AudioFskDemodulator(
+    private val onAudioEnergyUpdate: ((energy: Float) -> Unit)? = null,
     private val onPacketDecoded: (Packet) -> Unit
 ) {
     companion object {
         const val SAMPLE_RATE = 44100
-        const val FREQ_SPACE = 18500.0
-        const val FREQ_MARK = 19500.0
-        const val WINDOW_SIZE = (SAMPLE_RATE * 15) / 1000 // 15 ms window (661 samples)
+        var freqSpace = 18500.0
+        var freqMark = 19500.0
+        const val WINDOW_SIZE = (SAMPLE_RATE * 15) / 1000 // 15 ms window
     }
 
     private var audioRecord: AudioRecord? = null
     private var isRecording = false
     private var workerThread: Thread? = null
 
-    // Goertzel coefficients
-    private val coeffSpace = 2.0 * cos(2.0 * PI * FREQ_SPACE / SAMPLE_RATE)
-    private val coeffMark = 2.0 * cos(2.0 * PI * FREQ_MARK / SAMPLE_RATE)
+    private var coeffSpace = 2.0 * cos(2.0 * PI * freqSpace / SAMPLE_RATE)
+    private var coeffMark = 2.0 * cos(2.0 * PI * freqMark / SAMPLE_RATE)
 
     private val bitBuffer = ArrayList<Int>()
+
+    fun setFrequencies(space: Double, mark: Double) {
+        freqSpace = space
+        freqMark = mark
+        coeffSpace = 2.0 * cos(2.0 * PI * freqSpace / SAMPLE_RATE)
+        coeffMark = 2.0 * cos(2.0 * PI * freqMark / SAMPLE_RATE)
+    }
 
     fun startListening() {
         val minBufferSize = AudioRecord.getMinBufferSize(
@@ -55,9 +61,11 @@ class AudioFskDemodulator(
                 if (read == WINDOW_SIZE) {
                     val energySpace = goertzelEnergy(audioBuffer, coeffSpace)
                     val energyMark = goertzelEnergy(audioBuffer, coeffMark)
+                    val totalEnergy = (energySpace + energyMark).toFloat()
 
-                    // Check if energy exceeds ambient noise floor
-                    val threshold = 1.5e8
+                    onAudioEnergyUpdate?.invoke(totalEnergy)
+
+                    val threshold = 1.0e7
                     if (energySpace > threshold || energyMark > threshold) {
                         val bit = if (energyMark > energySpace) 1 else 0
                         processBit(bit)
@@ -81,10 +89,8 @@ class AudioFskDemodulator(
     private fun processBit(bit: Int) {
         bitBuffer.add(bit)
         if (bitBuffer.size >= Packet.HEADER_SIZE * 8) {
-            // Check if buffer contains a valid packet
             tryParsePacket()
         }
-        // Cap buffer to avoid unbounded growth
         if (bitBuffer.size > 2048) {
             bitBuffer.subList(0, 1024).clear()
         }
@@ -103,7 +109,6 @@ class AudioFskDemodulator(
             bytes[i] = b.toByte()
         }
 
-        // Sliding scan for valid packet
         for (offset in 0..bytes.size - Packet.HEADER_SIZE) {
             val candidate = bytes.copyOfRange(offset, bytes.size)
             try {
@@ -111,9 +116,7 @@ class AudioFskDemodulator(
                 onPacketDecoded(packet)
                 bitBuffer.clear()
                 return
-            } catch (_: Exception) {
-                // Keep sliding
-            }
+            } catch (_: Exception) {}
         }
     }
 
@@ -121,8 +124,10 @@ class AudioFskDemodulator(
         isRecording = false
         workerThread?.interrupt()
         workerThread = null
-        audioRecord?.stop()
-        audioRecord?.release()
+        try {
+            audioRecord?.stop()
+            audioRecord?.release()
+        } catch (_: Exception) {}
         audioRecord = null
     }
 }

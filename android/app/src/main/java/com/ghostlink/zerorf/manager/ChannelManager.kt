@@ -5,6 +5,8 @@ import com.ghostlink.zerorf.core.Chunker
 import com.ghostlink.zerorf.core.CryptoEngine
 import com.ghostlink.zerorf.core.Packet
 import com.ghostlink.zerorf.core.ReassemblyEngine
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 /**
  * Coordinates GhostLink Zero-RF transfer lifecycle across all physical layers.
@@ -22,22 +24,27 @@ class ChannelManager(
         ERROR
     }
 
+    enum class ChannelMode {
+        OPTICAL,       // Screen ⇢ Camera
+        ULTRASONIC,    // Speaker ⇢ Mic
+        MAGNETIC       // Motor ⇢ Magnetometer
+    }
+
     interface ChannelEventListener {
         fun onStateChanged(newState: State, message: String)
         fun onProgressUpdate(fraction: Float, speedBps: Double)
-        fun onFileReady(fileBytes: ByteArray)
+        fun onFileReady(fileName: String, fileBytes: ByteArray)
         fun onError(error: String)
     }
 
     companion object {
-        // Paired fallback seed so direct optical point-and-scan works instantly even without magnetic touch
         val DEFAULT_SEED = byteArrayOf(0xCA.toByte(), 0xFE.toByte(), 0xBA.toByte(), 0xBE.toByte())
     }
 
     var currentState: State = State.IDLE
         private set
 
-    var activeChannel: TransparentEta.ChannelType = TransparentEta.ChannelType.OPTICAL
+    var activeChannel: ChannelMode = ChannelMode.OPTICAL
         private set
 
     private var sessionKey: ByteArray? = null
@@ -45,25 +52,40 @@ class ChannelManager(
     private var outboundPackets: List<Packet>? = null
     private var currentLoopIndex = 0
 
-    /**
-     * SENDER: Initiates transfer of a file.
-     */
-    fun startSender(fileBytes: ByteArray, customSeed: ByteArray? = null) {
-        setState(State.HANDSHAKE, "Initiating contact magnetic handshake & optical broadcast...")
+    var currentFileName: String = "secret_payload.txt"
+        private set
 
-        val seed = customSeed ?: DEFAULT_SEED
-        sessionKey = CryptoEngine.deriveSessionKey(seed)
+    /**
+     * SENDER: Initiates transfer of a file with embedded metadata (filename + raw bytes).
+     */
+    fun startSender(fileName: String, fileBytes: ByteArray, mode: ChannelMode = ChannelMode.OPTICAL) {
+        this.currentFileName = fileName
+        this.activeChannel = mode
+        setState(State.HANDSHAKE, "Initiating physical link ($mode)...")
+
+        sessionKey = CryptoEngine.deriveSessionKey(DEFAULT_SEED)
+
+        // Pack filename metadata before encryption:
+        // [ 2 bytes: name length N ] [ N bytes: name UTF-8 ] [ fileBytes ]
+        val nameBytes = fileName.toByteArray(Charsets.UTF_8)
+        val metaBuffer = ByteBuffer.allocate(2 + nameBytes.size + fileBytes.size).order(ByteOrder.BIG_ENDIAN)
+        metaBuffer.putShort(nameBytes.size.toShort())
+        metaBuffer.put(nameBytes)
+        metaBuffer.put(fileBytes)
+        val bundledPayload = metaBuffer.array()
 
         // F7 Gate: Encrypt plaintext BEFORE chunking
-        val ciphertext = CryptoEngine.encrypt(fileBytes, sessionKey!!)
+        val ciphertext = CryptoEngine.encrypt(bundledPayload, sessionKey!!)
 
-        // Negotiate channel
-        setState(State.NEGOTIATE, "Evaluating sensors and channel bandwidth...")
-        activeChannel = TransparentEta.ChannelType.OPTICAL
+        // Determine chunk size based on physical layer
+        val chunkSize = when (mode) {
+            ChannelMode.OPTICAL -> Chunker.OPTICAL_DEFAULT_CHUNK_SIZE
+            ChannelMode.ULTRASONIC -> Chunker.ULTRASONIC_DEFAULT_CHUNK_SIZE
+            ChannelMode.MAGNETIC -> 8 // Tiny chunks for magnetic
+        }
 
-        // Prepare outbound packets
-        outboundPackets = Chunker.chunk(ciphertext, Chunker.OPTICAL_DEFAULT_CHUNK_SIZE)
-        setState(State.TRANSFER, "Streaming ${outboundPackets!!.size} encrypted frames via Optical QR...")
+        outboundPackets = Chunker.chunk(ciphertext, chunkSize, mode == ChannelMode.ULTRASONIC)
+        setState(State.TRANSFER, "Streaming ${outboundPackets!!.size} encrypted chunks via $mode...")
     }
 
     /**
@@ -78,14 +100,14 @@ class ChannelManager(
     }
 
     /**
-     * RECEIVER: Starts listening mode on camera / mic / magnetic sensors.
+     * RECEIVER: Starts listening mode on specified physical channel.
      */
-    fun startReceiver() {
+    fun startReceiver(mode: ChannelMode = ChannelMode.OPTICAL) {
+        this.activeChannel = mode
         if (sessionKey == null) {
             sessionKey = CryptoEngine.deriveSessionKey(DEFAULT_SEED)
         }
-        activeChannel = TransparentEta.ChannelType.OPTICAL
-        setState(State.TRANSFER, "Ready. Point camera at sender's screen or touch for magnetic handshake...")
+        setState(State.TRANSFER, "Listening on $mode physical channel...")
     }
 
     /**
@@ -94,16 +116,14 @@ class ChannelManager(
     fun onMagneticHandshakeReceived(packet: MagneticPacket) {
         sessionKey = CryptoEngine.deriveSessionKey(packet.saltSeed)
         setState(State.NEGOTIATE, "Handshake completed via magnetic contact. Seed derived.")
-        activeChannel = TransparentEta.ChannelType.OPTICAL
-        setState(State.TRANSFER, "Listening on Optical QR channel...")
+        setState(State.TRANSFER, "Ready on $activeChannel channel...")
     }
 
     /**
-     * RECEIVER: Ingests decoded packet from active physical channel (Camera or Mic).
+     * RECEIVER: Ingests decoded packet from active physical channel (Camera, Mic, or Magnetometer).
      */
     fun onPacketReceived(packet: Packet) {
         if (currentState != State.TRANSFER && currentState != State.NEGOTIATE) {
-            // Auto-transition to transfer if packet arrives
             currentState = State.TRANSFER
         }
 
@@ -113,40 +133,43 @@ class ChannelManager(
 
         if (reassemblyEngine == null || reassemblyEngine!!.totalChunks != packet.totalChunks) {
             reassemblyEngine = ReassemblyEngine(packet.totalChunks)
-            setState(State.TRANSFER, "Receiving chunks: total ${packet.totalChunks}")
+            setState(State.TRANSFER, "Receiving chunks: ${packet.chunkIndex + 1}/${packet.totalChunks}")
         }
 
         val engine = reassemblyEngine!!
         val isNew = engine.addPacket(packet)
 
         if (isNew) {
-            listener.onProgressUpdate(engine.progressFraction, TransparentEta.OPTICAL_BYTE_RATE)
+            val speed = when (activeChannel) {
+                ChannelMode.OPTICAL -> TransparentEta.OPTICAL_BYTE_RATE
+                ChannelMode.ULTRASONIC -> TransparentEta.ULTRASONIC_BYTE_RATE
+                ChannelMode.MAGNETIC -> 5.0
+            }
+            listener.onProgressUpdate(engine.progressFraction, speed)
         }
 
         if (engine.isComplete) {
-            setState(State.VERIFY, "100% frames received (${engine.totalChunks}/${engine.totalChunks}). Verifying CRC32 and AES-GCM tag...")
+            setState(State.VERIFY, "100% chunks received (${engine.totalChunks}/${engine.totalChunks}). Verifying CRC32 and AES-GCM tag...")
             try {
                 val fullCiphertext = engine.assemble()
-                val decryptedFile = CryptoEngine.decrypt(fullCiphertext, sessionKey!!)
-                setState(State.DONE, "Transfer complete! Zero-RF file reconstructed with 0 bit errors.")
-                listener.onFileReady(decryptedFile)
+                val decryptedBundled = CryptoEngine.decrypt(fullCiphertext, sessionKey!!)
+
+                // Unpack metadata: [2B length] [Name] [FileBytes]
+                val buf = ByteBuffer.wrap(decryptedBundled).order(ByteOrder.BIG_ENDIAN)
+                val nameLen = buf.short.toInt() and 0xFFFF
+                val nameBytes = ByteArray(nameLen)
+                buf.get(nameBytes)
+                val receivedName = String(nameBytes, Charsets.UTF_8)
+                val fileContentBytes = ByteArray(decryptedBundled.size - 2 - nameLen)
+                buf.get(fileContentBytes)
+
+                setState(State.DONE, "Transfer complete! Verified $receivedName (${fileContentBytes.size} bytes).")
+                listener.onFileReady(receivedName, fileContentBytes)
             } catch (e: Exception) {
-                setState(State.ERROR, "Integrity verification failed: ${e.message}")
+                setState(State.ERROR, "Verification failed: ${e.message}")
                 listener.onError("Decryption failed: ${e.message}")
             }
         }
-    }
-
-    /**
-     * Dynamic fallback triggered when camera is blocked/misaligned.
-     */
-    fun triggerFallbackToUltrasonic(fileSizeBytes: Long) {
-        if (fileSizeBytes > Chunker.ULTRASONIC_MAX_FILE_SIZE) {
-            listener.onError("Cannot fallback: file exceeds 128 KB acoustic cap. Re-align camera.")
-            return
-        }
-        activeChannel = TransparentEta.ChannelType.ULTRASONIC
-        setState(State.TRANSFER, "Falling back to Ultrasonic acoustic channel (~0.05 KB/s)...")
     }
 
     private fun setState(state: State, message: String) {
