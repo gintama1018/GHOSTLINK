@@ -36,12 +36,11 @@ import java.util.concurrent.Executors
 import kotlin.math.log10
 
 /**
- * Complete Hackathon-Ready Zero-RF Transceiver UI for GhostLink.
- * Features:
- * - Real Media & File Picker
- * - Channel Mode Switcher: [🔊 Acoustic Audio] [🧲 Magnetic Induction] [👁️ Optical QR]
- * - Live Hardware Sensor Oscilloscope (Real-time micro-Tesla & Acoustic energy graph)
- * - Automatic Saving to Downloads/GhostLink/
+ * GhostLink Zero-RF Transceiver UI.
+ * - Bulk Channels: OPTICAL (Screen ⇢ Camera) & ACOUSTIC (Speaker ⇢ Mic)
+ * - Handshake Layer: MAGNETIC (Motor ⇢ Magnetometer with live uT Oscilloscope)
+ * - Per-Session Cryptographic Seed: Fresh SecureRandom seed on every transfer
+ * - Media Picker & Automatic Downloads Storage
  */
 class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
 
@@ -55,8 +54,8 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
     private lateinit var audioDemodulator: AudioFskDemodulator
     private lateinit var cameraExecutor: ExecutorService
 
-    // Active mode
-    private var currentMode = ChannelManager.ChannelMode.OPTICAL
+    // Active bulk channel
+    private var currentBulkChannel = ChannelManager.BulkChannel.OPTICAL
 
     // Payload state
     private var selectedFileName = "secret_briefing.txt"
@@ -64,7 +63,7 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
 
     // UI elements
     private lateinit var statusText: TextView
-    private lateinit var channelBadge: TextView
+    private lateinit var handshakeBadge: TextView
     private lateinit var etaText: TextView
     private lateinit var progressBar: ProgressBar
     private lateinit var qrImageView: ImageView
@@ -77,7 +76,6 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
 
     private lateinit var tabOptical: Button
     private lateinit var tabAcoustic: Button
-    private lateinit var tabMagnetic: Button
 
     private var isTransmitting = false
     private var cameraProvider: ProcessCameraProvider? = null
@@ -102,6 +100,7 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
                     selectedFileName = name
                     selectedFileBytes = bytes
                     fileInfoText.text = "Selected: $name (${(bytes.size / 1024.0).format(1)} KB)"
+                    updateEtaDisplay()
                     log("File loaded: $name (${bytes.size} bytes)")
                 }
             } catch (e: Exception) {
@@ -118,12 +117,12 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
 
             vibrationTransmitter = VibrationTransmitter(this)
 
-            // Magnetometer receiver with live sample telemetry feeding the oscilloscope
+            // Magnetometer receiver with live telemetry for oscilloscope
             magnetometerReceiver = MagnetometerReceiver(
                 context = this,
                 onSampleUpdate = { rawMag, delta ->
                     handler.post {
-                        if (currentMode == ChannelManager.ChannelMode.MAGNETIC && previewView.visibility != View.VISIBLE) {
+                        if (scopeView.visibility == View.VISIBLE && currentBulkChannel == ChannelManager.BulkChannel.OPTICAL) {
                             val pulseText = if (delta > 4.5f) "🔥 PULSE: ${delta.format(1)} uT" else "${rawMag.format(1)} uT (Ambient)"
                             scopeView.pushSample(delta * 8f, pulseText)
                         }
@@ -131,7 +130,9 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
                 },
                 onPacketReceived = { packet ->
                     handler.post {
-                        log("Magnetic handshake token decoded! Seed: 0x${packet.crc16.toString(16)}")
+                        handshakeBadge.text = "HANDSHAKE: VERIFIED (MAGNETIC)"
+                        handshakeBadge.setTextColor(Color.parseColor("#22C55E"))
+                        log("Magnetic handshake verified! Fresh seed: 0x${packet.crc16.toString(16)}")
                         channelManager.onMagneticHandshakeReceived(packet)
                     }
                 }
@@ -139,11 +140,11 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
 
             audioModulator = AudioFskModulator()
 
-            // Acoustic demodulator with live energy telemetry feeding the oscilloscope
+            // Acoustic demodulator with live energy telemetry
             audioDemodulator = AudioFskDemodulator(
                 onAudioEnergyUpdate = { energy ->
                     handler.post {
-                        if (currentMode == ChannelManager.ChannelMode.ULTRASONIC && previewView.visibility != View.VISIBLE) {
+                        if (scopeView.visibility == View.VISIBLE && currentBulkChannel == ChannelManager.BulkChannel.ULTRASONIC) {
                             val db = if (energy > 1.0) (10 * log10(energy.toDouble())).toFloat() else 0f
                             scopeView.pushSample(db * 0.8f, "${db.format(1)} dB (18.5 kHz)")
                         }
@@ -202,31 +203,39 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
         root.addView(title)
         root.addView(subtitle)
 
-        // Physical Channel Tabs
+        // Bulk Channel Switcher Tabs
         val tabLayout = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(0, 0, 0, 16)
+            setPadding(0, 0, 0, 12)
         }
-        tabOptical = createTabButton("👁️ Optical QR", Color.parseColor("#F0A93E"), true) {
-            setChannelMode(ChannelManager.ChannelMode.OPTICAL)
+        tabOptical = createTabButton("👁️ Optical QR (Bulk)", Color.parseColor("#F0A93E"), true) {
+            setBulkChannel(ChannelManager.BulkChannel.OPTICAL)
         }
-        tabAcoustic = createTabButton("🔊 Acoustic", Color.parseColor("#4CD9D0"), false) {
-            setChannelMode(ChannelManager.ChannelMode.ULTRASONIC)
-        }
-        tabMagnetic = createTabButton("🧲 Magnetic", Color.parseColor("#B18CFF"), false) {
-            setChannelMode(ChannelManager.ChannelMode.MAGNETIC)
+        tabAcoustic = createTabButton("🔊 Ultrasonic (Acoustic)", Color.parseColor("#4CD9D0"), false) {
+            setBulkChannel(ChannelManager.BulkChannel.ULTRASONIC)
         }
         tabLayout.addView(tabOptical)
         tabLayout.addView(tabAcoustic)
-        tabLayout.addView(tabMagnetic)
         root.addView(tabLayout)
+
+        // Handshake Status Indicator
+        handshakeBadge = TextView(this).apply {
+            text = "HANDSHAKE: READY (Touch for Magnetometer / Auto via Stream)"
+            textSize = 11f
+            setTextColor(Color.parseColor("#B18CFF"))
+            setBackgroundColor(Color.parseColor("#141C31"))
+            setPadding(16, 8, 16, 8)
+        }
+        root.addView(handshakeBadge)
 
         // Stage Container (Holds Camera Preview, QR Stream, and Live Scope)
         val stage = FrameLayout(this).apply {
             setBackgroundColor(Color.parseColor("#141C31"))
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 500
-            )
+            ).apply {
+                setMargins(0, 14, 0, 0)
+            }
         }
 
         // Live Camera Preview
@@ -256,7 +265,7 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
 
         // Stage Prompt Label
         stageLabel = TextView(this).apply {
-            text = "HARDWARE TRANSCEIVER STAGE\nSelect file and tap 'Send' to broadcast\nor tap 'Receive' to start physical sensors"
+            text = "HARDWARE TRANSCEIVER STAGE\nTap 'Transmit (Tx)' to broadcast\nor 'Receive (Rx)' to start physical sensors"
             textSize = 12f
             setTextColor(Color.parseColor("#7385AC"))
             gravity = Gravity.CENTER
@@ -345,7 +354,7 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
 
         // Log Console
         logView = TextView(this).apply {
-            text = "[System] GhostLink v0.2.2 Engine Ready.\n"
+            text = "[System] GhostLink v0.2.3 Core Initialized.\n"
             textSize = 10f
             setTextColor(Color.parseColor("#7385AC"))
             typeface = android.graphics.Typeface.MONOSPACE
@@ -356,6 +365,8 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
 
         scroll.addView(root)
         setContentView(scroll)
+
+        updateEtaDisplay()
     }
 
     private fun createTabButton(label: String, color: Int, isActive: Boolean, onClick: () -> Unit): Button {
@@ -371,27 +382,29 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
         }
     }
 
-    private fun setChannelMode(mode: ChannelManager.ChannelMode) {
-        currentMode = mode
-        tabOptical.setTextColor(if (mode == ChannelManager.ChannelMode.OPTICAL) Color.parseColor("#F0A93E") else Color.parseColor("#7385AC"))
-        tabAcoustic.setTextColor(if (mode == ChannelManager.ChannelMode.ULTRASONIC) Color.parseColor("#4CD9D0") else Color.parseColor("#7385AC"))
-        tabMagnetic.setTextColor(if (mode == ChannelManager.ChannelMode.MAGNETIC) Color.parseColor("#B18CFF") else Color.parseColor("#7385AC"))
+    private fun setBulkChannel(channel: ChannelManager.BulkChannel) {
+        currentBulkChannel = channel
+        tabOptical.setTextColor(if (channel == ChannelManager.BulkChannel.OPTICAL) Color.parseColor("#F0A93E") else Color.parseColor("#7385AC"))
+        tabAcoustic.setTextColor(if (channel == ChannelManager.BulkChannel.ULTRASONIC) Color.parseColor("#4CD9D0") else Color.parseColor("#7385AC"))
 
-        when (mode) {
-            ChannelManager.ChannelMode.OPTICAL -> {
-                scopeView.channelColor = Color.parseColor("#F0A93E")
-                scopeView.sensorLabel = "OPTICAL STREAM"
-            }
-            ChannelManager.ChannelMode.ULTRASONIC -> {
-                scopeView.channelColor = Color.parseColor("#4CD9D0")
-                scopeView.sensorLabel = "ACOUSTIC MICROPHONE FFT (18.5/19.5 kHz)"
-            }
-            ChannelManager.ChannelMode.MAGNETIC -> {
-                scopeView.channelColor = Color.parseColor("#B18CFF")
-                scopeView.sensorLabel = "MAGNETOMETER INDUCTION (uT)"
-            }
+        if (channel == ChannelManager.BulkChannel.ULTRASONIC) {
+            scopeView.channelColor = Color.parseColor("#4CD9D0")
+            scopeView.sensorLabel = "ACOUSTIC MICROPHONE FFT (18.5/19.5 kHz)"
+        } else {
+            scopeView.channelColor = Color.parseColor("#B18CFF")
+            scopeView.sensorLabel = "MAGNETOMETER INDUCTION (uT)"
         }
-        log("Channel mode set to $mode")
+
+        updateEtaDisplay()
+        log("Bulk channel set to $channel")
+    }
+
+    private fun updateEtaDisplay() {
+        val eta = when (currentBulkChannel) {
+            ChannelManager.BulkChannel.OPTICAL -> TransparentEta.calculateOpticalEta(selectedFileBytes.size.toLong())
+            ChannelManager.BulkChannel.ULTRASONIC -> TransparentEta.calculateUltrasonicEta(selectedFileBytes.size.toLong())
+        }
+        etaText.text = "Transparent ETA (F6): ${eta.formattedTime} (${eta.speedDescription})"
     }
 
     private fun startSendFlow() {
@@ -401,34 +414,29 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
             stageLabel.visibility = View.GONE
             previewView.visibility = View.GONE
 
-            log("Starting physical transmission: $selectedFileName (${selectedFileBytes.size} bytes) via $currentMode...")
+            log("Initiating transmission: $selectedFileName (${selectedFileBytes.size} bytes) via $currentBulkChannel...")
 
-            // Calculate ETA
-            val speed = when (currentMode) {
-                ChannelManager.ChannelMode.OPTICAL -> TransparentEta.OPTICAL_BYTE_RATE
-                ChannelManager.ChannelMode.ULTRASONIC -> TransparentEta.ULTRASONIC_BYTE_RATE
-                ChannelManager.ChannelMode.MAGNETIC -> 5.0
-            }
-            val etaSec = ((selectedFileBytes.size / speed) * 1.25).toInt()
-            etaText.text = "ETA: ~${etaSec}s (${currentMode.name})"
+            // 1. ChannelManager generates fresh per-session SecureRandom seed and encrypts with AES-GCM
+            channelManager.startSender(selectedFileName, selectedFileBytes, currentBulkChannel)
+            val sessionSeed = channelManager.activeSessionSeed!!
+            log("Cryptographic seed generated: 0x${sessionSeed.joinToString("") { "%02x".format(it) }}")
 
-            channelManager.startSender(selectedFileName, selectedFileBytes, currentMode)
+            // 2. Transmit magnetic contact pulse with this exact fresh seed via vibration motor
+            val hsPacket = MagneticPacket.create(0x11, sessionSeed)
+            vibrationTransmitter.transmit(hsPacket)
+            log("Vibrating motor with 8-byte pairing token (contact <2cm)...")
 
-            when (currentMode) {
-                ChannelManager.ChannelMode.OPTICAL -> {
+            // 3. Start bulk transmission
+            when (currentBulkChannel) {
+                ChannelManager.BulkChannel.OPTICAL -> {
                     scopeView.visibility = View.GONE
                     qrImageView.visibility = View.VISIBLE
                     startQrCarouselLoop()
                 }
-                ChannelManager.ChannelMode.ULTRASONIC -> {
+                ChannelManager.BulkChannel.ULTRASONIC -> {
                     qrImageView.visibility = View.GONE
                     scopeView.visibility = View.VISIBLE
                     startAcousticBroadcastLoop()
-                }
-                ChannelManager.ChannelMode.MAGNETIC -> {
-                    qrImageView.visibility = View.GONE
-                    scopeView.visibility = View.VISIBLE
-                    startMagneticPulseBroadcast()
                 }
             }
         } catch (e: Exception) {
@@ -454,26 +462,13 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
     private fun startAcousticBroadcastLoop() {
         if (!isTransmitting) return
         Thread {
-            while (isTransmitting && currentMode == ChannelManager.ChannelMode.ULTRASONIC) {
+            while (isTransmitting && currentBulkChannel == ChannelManager.BulkChannel.ULTRASONIC) {
                 val packet = channelManager.getNextOutboundPacket() ?: break
                 handler.post {
-                    statusText.text = "Playing Ultrasonic FSK Tone Burst #${packet.chunkIndex + 1}/${packet.totalChunks}..."
+                    statusText.text = "Playing Ultrasonic Tone Burst #${packet.chunkIndex + 1}/${packet.totalChunks} (~8.5 B/s)..."
                 }
                 audioModulator.playPacket(packet)
-                Thread.sleep(100)
-            }
-        }.start()
-    }
-
-    private fun startMagneticPulseBroadcast() {
-        Thread {
-            while (isTransmitting && currentMode == ChannelManager.ChannelMode.MAGNETIC) {
-                val hsPacket = MagneticPacket.create(0x11, ChannelManager.DEFAULT_SEED)
-                handler.post {
-                    statusText.text = "Vibrating motor in magnetic pulse pattern (Touch phones <2cm)..."
-                }
-                vibrationTransmitter.transmit(hsPacket)
-                Thread.sleep(2000)
+                Thread.sleep(80)
             }
         }.start()
     }
@@ -484,14 +479,16 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
             stageLabel.visibility = View.GONE
             qrImageView.visibility = View.GONE
 
-            log("Entering Receive Mode on $currentMode channel...")
-            channelManager.startReceiver(currentMode)
+            log("Entering Receive Mode on $currentBulkChannel channel...")
+            channelManager.startReceiver(currentBulkChannel)
 
-            when (currentMode) {
-                ChannelManager.ChannelMode.OPTICAL -> {
+            // Always start magnetometer so contact handshake is continuously detected
+            magnetometerReceiver.startListening()
+
+            when (currentBulkChannel) {
+                ChannelManager.BulkChannel.OPTICAL -> {
                     scopeView.visibility = View.GONE
                     previewView.visibility = View.VISIBLE
-                    magnetometerReceiver.stopListening()
                     audioDemodulator.stopListening()
 
                     if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
@@ -500,11 +497,10 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
                         ActivityCompat.requestPermissions(this, arrayOf(android.Manifest.permission.CAMERA), 101)
                     }
                 }
-                ChannelManager.ChannelMode.ULTRASONIC -> {
+                ChannelManager.BulkChannel.ULTRASONIC -> {
                     stopCamera()
                     previewView.visibility = View.GONE
                     scopeView.visibility = View.VISIBLE
-                    magnetometerReceiver.stopListening()
 
                     if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                         audioDemodulator.startListening()
@@ -512,14 +508,6 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
                     } else {
                         ActivityCompat.requestPermissions(this, arrayOf(android.Manifest.permission.RECORD_AUDIO), 102)
                     }
-                }
-                ChannelManager.ChannelMode.MAGNETIC -> {
-                    stopCamera()
-                    previewView.visibility = View.GONE
-                    scopeView.visibility = View.VISIBLE
-                    audioDemodulator.stopListening()
-                    magnetometerReceiver.startListening()
-                    statusText.text = "Sampling magnetometer at 100Hz. Bring transmitting phone touching..."
                 }
             }
         } catch (e: Exception) {
@@ -573,9 +561,9 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == 101 && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            if (currentMode == ChannelManager.ChannelMode.OPTICAL) startCameraScanner()
+            if (currentBulkChannel == ChannelManager.BulkChannel.OPTICAL) startCameraScanner()
         } else if (requestCode == 102 && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            if (currentMode == ChannelManager.ChannelMode.ULTRASONIC) audioDemodulator.startListening()
+            if (currentBulkChannel == ChannelManager.BulkChannel.ULTRASONIC) audioDemodulator.startListening()
         }
     }
 
@@ -589,7 +577,7 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
         val percent = (fraction * 100).toInt()
         progressBar.progress = percent
         val kbps = speedBps / 1024.0
-        etaText.text = "Progress: $percent% (${speedBps.format(0)} B/s · ${kbps.format(2)} KB/s)"
+        etaText.text = "Progress: $percent% (${speedBps.format(1)} B/s · ${kbps.format(2)} KB/s)"
         statusText.text = "Receiving chunks: $percent% complete"
     }
 

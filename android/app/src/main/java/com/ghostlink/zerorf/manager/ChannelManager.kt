@@ -7,9 +7,12 @@ import com.ghostlink.zerorf.core.Packet
 import com.ghostlink.zerorf.core.ReassemblyEngine
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.SecureRandom
 
 /**
- * Coordinates GhostLink Zero-RF transfer lifecycle across all physical layers.
+ * Coordinates GhostLink Zero-RF transfer lifecycle across physical layers.
+ * Bulk channels: OPTICAL (Screen ⇢ Camera) and ULTRASONIC (Speaker ⇢ Mic).
+ * Handshake layer: MAGNETIC (Vibration Motor ⇢ Magnetometer).
  */
 class ChannelManager(
     private val listener: ChannelEventListener
@@ -24,10 +27,9 @@ class ChannelManager(
         ERROR
     }
 
-    enum class ChannelMode {
-        OPTICAL,       // Screen ⇢ Camera
-        ULTRASONIC,    // Speaker ⇢ Mic
-        MAGNETIC       // Motor ⇢ Magnetometer
+    enum class BulkChannel {
+        OPTICAL,       // Screen ⇢ Camera (~1.0–2.5 KB/s)
+        ULTRASONIC     // Speaker ⇢ Mic (~8.5 B/s, max 128 KB)
     }
 
     interface ChannelEventListener {
@@ -37,14 +39,14 @@ class ChannelManager(
         fun onError(error: String)
     }
 
-    companion object {
-        val DEFAULT_SEED = byteArrayOf(0xCA.toByte(), 0xFE.toByte(), 0xBA.toByte(), 0xBE.toByte())
-    }
-
     var currentState: State = State.IDLE
         private set
 
-    var activeChannel: ChannelMode = ChannelMode.OPTICAL
+    var activeBulkChannel: BulkChannel = BulkChannel.OPTICAL
+        private set
+
+    // True per-session cryptographic seed (Generated fresh via SecureRandom for each transfer)
+    var activeSessionSeed: ByteArray? = null
         private set
 
     private var sessionKey: ByteArray? = null
@@ -52,20 +54,27 @@ class ChannelManager(
     private var outboundPackets: List<Packet>? = null
     private var currentLoopIndex = 0
 
+    var isMagneticHandshakeVerified: Boolean = false
+        private set
+
     var currentFileName: String = "secret_payload.txt"
         private set
 
     /**
-     * SENDER: Initiates transfer of a file with embedded metadata (filename + raw bytes).
+     * SENDER: Initiates transfer of a file.
+     * Generates a fresh 4-byte SecureRandom seed for this transfer session.
      */
-    fun startSender(fileName: String, fileBytes: ByteArray, mode: ChannelMode = ChannelMode.OPTICAL) {
+    fun startSender(fileName: String, fileBytes: ByteArray, channel: BulkChannel = BulkChannel.OPTICAL) {
         this.currentFileName = fileName
-        this.activeChannel = mode
-        setState(State.HANDSHAKE, "Initiating physical link ($mode)...")
+        this.activeBulkChannel = channel
+        setState(State.HANDSHAKE, "Generating cryptographic session seed & initiating transfer...")
 
-        sessionKey = CryptoEngine.deriveSessionKey(DEFAULT_SEED)
+        // 1. Generate fresh per-session SecureRandom seed (4 bytes / 32 bits of entropy)
+        val seed = ByteArray(4).apply { SecureRandom().nextBytes(this) }
+        this.activeSessionSeed = seed
+        this.sessionKey = CryptoEngine.deriveSessionKey(seed)
 
-        // Pack filename metadata before encryption:
+        // 2. Pack filename metadata before encryption:
         // [ 2 bytes: name length N ] [ N bytes: name UTF-8 ] [ fileBytes ]
         val nameBytes = fileName.toByteArray(Charsets.UTF_8)
         val metaBuffer = ByteBuffer.allocate(2 + nameBytes.size + fileBytes.size).order(ByteOrder.BIG_ENDIAN)
@@ -74,18 +83,35 @@ class ChannelManager(
         metaBuffer.put(fileBytes)
         val bundledPayload = metaBuffer.array()
 
-        // F7 Gate: Encrypt plaintext BEFORE chunking
+        // 3. F7 Gate: Encrypt entire plaintext bundle with session key BEFORE chunking
         val ciphertext = CryptoEngine.encrypt(bundledPayload, sessionKey!!)
 
-        // Determine chunk size based on physical layer
-        val chunkSize = when (mode) {
-            ChannelMode.OPTICAL -> Chunker.OPTICAL_DEFAULT_CHUNK_SIZE
-            ChannelMode.ULTRASONIC -> Chunker.ULTRASONIC_DEFAULT_CHUNK_SIZE
-            ChannelMode.MAGNETIC -> 8 // Tiny chunks for magnetic
+        // 4. Split ciphertext into chunks based on physical channel
+        val chunkSize = when (channel) {
+            BulkChannel.OPTICAL -> Chunker.OPTICAL_DEFAULT_CHUNK_SIZE
+            BulkChannel.ULTRASONIC -> Chunker.ULTRASONIC_DEFAULT_CHUNK_SIZE
         }
 
-        outboundPackets = Chunker.chunk(ciphertext, chunkSize, mode == ChannelMode.ULTRASONIC)
-        setState(State.TRANSFER, "Streaming ${outboundPackets!!.size} encrypted chunks via $mode...")
+        val rawPackets = Chunker.chunk(ciphertext, chunkSize, channel == BulkChannel.ULTRASONIC)
+
+        // 5. Prepend the 4-byte session seed to chunk 0 payload so optical / audio receiver can extract it
+        val finalPackets = ArrayList<Packet>(rawPackets.size)
+        for (i in rawPackets.indices) {
+            val p = rawPackets[i]
+            if (i == 0) {
+                // Chunk 0 payload: [4 bytes: activeSessionSeed] + [ciphertext chunk 0 bytes]
+                val chunk0Buf = ByteBuffer.allocate(4 + p.payload.size)
+                chunk0Buf.put(seed)
+                chunk0Buf.put(p.payload)
+                finalPackets.add(Packet.create(0L, p.totalChunks, chunk0Buf.array()))
+            } else {
+                finalPackets.add(p)
+            }
+        }
+
+        this.outboundPackets = finalPackets
+        this.currentLoopIndex = 0
+        setState(State.TRANSFER, "Streaming ${finalPackets.size} encrypted chunks via $channel...")
     }
 
     /**
@@ -100,56 +126,90 @@ class ChannelManager(
     }
 
     /**
-     * RECEIVER: Starts listening mode on specified physical channel.
+     * RECEIVER: Starts listening on specified bulk channel.
      */
-    fun startReceiver(mode: ChannelMode = ChannelMode.OPTICAL) {
-        this.activeChannel = mode
-        if (sessionKey == null) {
-            sessionKey = CryptoEngine.deriveSessionKey(DEFAULT_SEED)
-        }
-        setState(State.TRANSFER, "Listening on $mode physical channel...")
+    fun startReceiver(channel: BulkChannel = BulkChannel.OPTICAL) {
+        this.activeBulkChannel = channel
+        this.reassemblyEngine = null
+        this.sessionKey = null
+        this.activeSessionSeed = null
+        this.isMagneticHandshakeVerified = false
+        setState(State.TRANSFER, "Listening on $channel channel...")
     }
 
     /**
      * RECEIVER: Ingests 8-byte magnetic handshake packet from sender.
      */
     fun onMagneticHandshakeReceived(packet: MagneticPacket) {
-        sessionKey = CryptoEngine.deriveSessionKey(packet.saltSeed)
-        setState(State.NEGOTIATE, "Handshake completed via magnetic contact. Seed derived.")
-        setState(State.TRANSFER, "Ready on $activeChannel channel...")
+        val seed = packet.saltSeed
+        this.activeSessionSeed = seed
+        this.sessionKey = CryptoEngine.deriveSessionKey(seed)
+        this.isMagneticHandshakeVerified = true
+        setState(State.NEGOTIATE, "Magnetic contact handshake verified! 32-bit seed received.")
+        setState(State.TRANSFER, "Ready on $activeBulkChannel channel...")
     }
 
     /**
-     * RECEIVER: Ingests decoded packet from active physical channel (Camera, Mic, or Magnetometer).
+     * RECEIVER: Ingests decoded packet from active physical channel (Camera or Mic).
      */
     fun onPacketReceived(packet: Packet) {
         if (currentState != State.TRANSFER && currentState != State.NEGOTIATE) {
             currentState = State.TRANSFER
         }
 
-        if (sessionKey == null) {
-            sessionKey = CryptoEngine.deriveSessionKey(DEFAULT_SEED)
-        }
-
+        // Initialize reassembly engine if needed
         if (reassemblyEngine == null || reassemblyEngine!!.totalChunks != packet.totalChunks) {
             reassemblyEngine = ReassemblyEngine(packet.totalChunks)
             setState(State.TRANSFER, "Receiving chunks: ${packet.chunkIndex + 1}/${packet.totalChunks}")
         }
 
         val engine = reassemblyEngine!!
-        val isNew = engine.addPacket(packet)
+
+        // Handle chunk 0 seed extraction
+        val actualPayload: ByteArray
+        if (packet.chunkIndex == 0L) {
+            if (packet.payload.size < 4) {
+                listener.onError("Malformed chunk 0 (less than 4-byte seed)")
+                return
+            }
+            val seed = packet.payload.copyOfRange(0, 4)
+            if (sessionKey == null) {
+                // If magnetic handshake wasn't used, derive key from optical/audio chunk 0 seed
+                activeSessionSeed = seed
+                sessionKey = CryptoEngine.deriveSessionKey(seed)
+            }
+            // Strip the 4-byte seed before buffering chunk 0 ciphertext
+            actualPayload = packet.payload.copyOfRange(4, packet.payload.size)
+        } else {
+            actualPayload = packet.payload
+        }
+
+        val strippedPacket = Packet(
+            chunkIndex = packet.chunkIndex,
+            totalChunks = packet.totalChunks,
+            payloadLength = actualPayload.size,
+            checksum = packet.checksum,
+            payload = actualPayload
+        )
+
+        val isNew = engine.addPacket(strippedPacket)
 
         if (isNew) {
-            val speed = when (activeChannel) {
-                ChannelMode.OPTICAL -> TransparentEta.OPTICAL_BYTE_RATE
-                ChannelMode.ULTRASONIC -> TransparentEta.ULTRASONIC_BYTE_RATE
-                ChannelMode.MAGNETIC -> 5.0
+            val speed = when (activeBulkChannel) {
+                BulkChannel.OPTICAL -> TransparentEta.OPTICAL_BYTE_RATE
+                BulkChannel.ULTRASONIC -> TransparentEta.ULTRASONIC_BYTE_RATE
             }
             listener.onProgressUpdate(engine.progressFraction, speed)
         }
 
         if (engine.isComplete) {
-            setState(State.VERIFY, "100% chunks received (${engine.totalChunks}/${engine.totalChunks}). Verifying CRC32 and AES-GCM tag...")
+            setState(State.VERIFY, "100% chunks received. Verifying CRC32 and AES-GCM-256 tag...")
+            if (sessionKey == null) {
+                setState(State.ERROR, "Session key missing. Handshake not established.")
+                listener.onError("Cannot decrypt: Session key missing.")
+                return
+            }
+
             try {
                 val fullCiphertext = engine.assemble()
                 val decryptedBundled = CryptoEngine.decrypt(fullCiphertext, sessionKey!!)
@@ -180,6 +240,8 @@ class ChannelManager(
     fun reset() {
         currentState = State.IDLE
         sessionKey = null
+        activeSessionSeed = null
+        isMagneticHandshakeVerified = false
         reassemblyEngine = null
         outboundPackets = null
         currentLoopIndex = 0
