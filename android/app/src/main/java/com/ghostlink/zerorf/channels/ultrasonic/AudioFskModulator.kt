@@ -76,6 +76,11 @@ class AudioFskModulator {
         )
         val bufferSize = maxOf(minBufferSize, pcm.size * 2)
 
+        try {
+            audioTrack?.stop()
+            audioTrack?.release()
+        } catch (_: Exception) {}
+
         audioTrack = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()

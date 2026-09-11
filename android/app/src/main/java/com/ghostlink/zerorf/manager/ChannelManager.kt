@@ -153,6 +153,8 @@ class ChannelManager(
      * RECEIVER: Ingests decoded packet from active physical channel (Camera or Mic).
      */
     fun onPacketReceived(packet: Packet) {
+        if (currentState == State.DONE) return
+
         if (currentState != State.TRANSFER && currentState != State.NEGOTIATE) {
             currentState = State.TRANSFER
         }
@@ -223,6 +225,7 @@ class ChannelManager(
                 val fileContentBytes = ByteArray(decryptedBundled.size - 2 - nameLen)
                 buf.get(fileContentBytes)
 
+                reassemblyEngine = null
                 setState(State.DONE, "Transfer complete! Verified $receivedName (${fileContentBytes.size} bytes).")
                 listener.onFileReady(receivedName, fileContentBytes)
             } catch (e: Exception) {
