@@ -8,6 +8,7 @@ object ProtocolConstants {
     const val MAGIC_BYTE_1: Byte = 0x47 // 'G'
     const val MAGIC_BYTE_2: Byte = 0x4C // 'L'
     const val PROTOCOL_VERSION: Byte = 0x02
+    const val WIRE_VERSION: Byte = 0x02
 
     // Memory and chunk limits to prevent allocation abuse and OOM attacks
     const val MAX_CHUNK_SIZE = 1024 // Maximum payload bytes per physical chunk

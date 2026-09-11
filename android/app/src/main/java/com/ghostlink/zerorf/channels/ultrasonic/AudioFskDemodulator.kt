@@ -7,6 +7,7 @@ import android.os.Build
 import com.ghostlink.zerorf.channels.ultrasonic.modem.AcousticFramer
 import com.ghostlink.zerorf.channels.ultrasonic.modem.AcousticMode
 import com.ghostlink.zerorf.channels.ultrasonic.modem.AcousticSynchronizer
+import com.ghostlink.zerorf.channels.ultrasonic.modem.FecCodec
 import com.ghostlink.zerorf.core.Packet
 import kotlin.math.PI
 import kotlin.math.cos
@@ -14,17 +15,97 @@ import kotlin.math.log10
 
 /**
  * Adaptive Multi-Mode Acoustic Demodulator.
- * Utilizes a multi-bin Goertzel filter bank, Barker-13 cross-correlation synchronization,
- * and empirical SNR estimation.
+ * Utilizes a multi-bin Goertzel filter bank, multi-stage Barker-13 cross-correlation,
+ * Hamming(8,4) SEC-DED forward error correction, and hysteresis-backed adaptive mode control.
  */
 class AudioFskDemodulator(
     var activeMode: AcousticMode = AcousticMode.DEFAULT_MODE,
     private val onAudioEnergyUpdate: ((energy: Float, snrDb: Float) -> Unit)? = null,
+    private val onFecTelemetry: ((singleBitFixes: Int, doubleBitErrors: Int) -> Unit)? = null,
     private val onPacketDecoded: (Packet) -> Unit
 ) {
     companion object {
         const val SAMPLE_RATE = AcousticMode.SAMPLE_RATE
     }
+
+    class AdaptiveModeController(
+        var currentMode: AcousticMode = AcousticMode.DEFAULT_MODE,
+        val onModeChanged: (AcousticMode) -> Unit = {}
+    ) {
+        private var highSnrStartTimeMs: Long = 0L
+        private var lowSnrStartTimeMs: Long = 0L
+        private var lastSwitchTimeMs: Long = 0L
+
+        companion object {
+            const val UPGRADE_DWELL_MS = 500L
+            const val DOWNGRADE_DWELL_MS = 300L
+            const val COOLDOWN_MS = 1500L
+
+            const val SNR_UPGRADE_TO_MODE_1 = 10.0f
+            const val SNR_UPGRADE_TO_MODE_2 = 16.0f
+
+            const val SNR_DOWNGRADE_TO_MODE_1 = 13.0f
+            const val SNR_DOWNGRADE_TO_MODE_0 = 8.0f
+        }
+
+        fun updateSnr(snrDb: Float, nowMs: Long = System.currentTimeMillis()) {
+            if (nowMs - lastSwitchTimeMs < COOLDOWN_MS) return
+
+            when (currentMode) {
+                AcousticMode.MODE_0_BFSK -> {
+                    if (snrDb >= SNR_UPGRADE_TO_MODE_1) {
+                        if (highSnrStartTimeMs == 0L) highSnrStartTimeMs = nowMs
+                        else if (nowMs - highSnrStartTimeMs >= UPGRADE_DWELL_MS) {
+                            currentMode = AcousticMode.MODE_1_4FSK
+                            lastSwitchTimeMs = nowMs
+                            highSnrStartTimeMs = 0L
+                            onModeChanged(currentMode)
+                        }
+                    } else {
+                        highSnrStartTimeMs = 0L
+                    }
+                }
+                AcousticMode.MODE_1_4FSK -> {
+                    if (snrDb >= SNR_UPGRADE_TO_MODE_2) {
+                        if (highSnrStartTimeMs == 0L) highSnrStartTimeMs = nowMs
+                        else if (nowMs - highSnrStartTimeMs >= UPGRADE_DWELL_MS) {
+                            currentMode = AcousticMode.MODE_2_8FSK
+                            lastSwitchTimeMs = nowMs
+                            highSnrStartTimeMs = 0L
+                            onModeChanged(currentMode)
+                        }
+                    } else if (snrDb < SNR_DOWNGRADE_TO_MODE_0) {
+                        if (lowSnrStartTimeMs == 0L) lowSnrStartTimeMs = nowMs
+                        else if (nowMs - lowSnrStartTimeMs >= DOWNGRADE_DWELL_MS) {
+                            currentMode = AcousticMode.MODE_0_BFSK
+                            lastSwitchTimeMs = nowMs
+                            lowSnrStartTimeMs = 0L
+                            onModeChanged(currentMode)
+                        }
+                    } else {
+                        highSnrStartTimeMs = 0L
+                        lowSnrStartTimeMs = 0L
+                    }
+                }
+                AcousticMode.MODE_2_8FSK -> {
+                    if (snrDb < SNR_DOWNGRADE_TO_MODE_1) {
+                        if (lowSnrStartTimeMs == 0L) lowSnrStartTimeMs = nowMs
+                        else if (nowMs - lowSnrStartTimeMs >= DOWNGRADE_DWELL_MS) {
+                            currentMode = AcousticMode.MODE_1_4FSK
+                            lastSwitchTimeMs = nowMs
+                            lowSnrStartTimeMs = 0L
+                            onModeChanged(currentMode)
+                        }
+                    } else {
+                        lowSnrStartTimeMs = 0L
+                    }
+                }
+            }
+        }
+    }
+
+    val adaptiveController = AdaptiveModeController(activeMode) { newMode -> setMode(newMode) }
+    var isAdaptiveEnabled = true
 
     private var audioRecord: AudioRecord? = null
     @Volatile
@@ -58,93 +139,110 @@ class AudioFskDemodulator(
         )
         val bufferSize = maxOf(minBufferSize, windowSize * 4)
 
-        val sources = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            intArrayOf(
-                MediaRecorder.AudioSource.UNPROCESSED,
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                MediaRecorder.AudioSource.MIC
-            )
+        val audioSource = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            MediaRecorder.AudioSource.UNPROCESSED
         } else {
-            intArrayOf(
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                MediaRecorder.AudioSource.MIC
-            )
+            MediaRecorder.AudioSource.MIC
         }
 
-        var record: AudioRecord? = null
-        for (src in sources) {
-            try {
-                val candidate = AudioRecord(
-                    src,
+        try {
+            audioRecord = AudioRecord(
+                audioSource,
+                SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufferSize
+            )
+
+            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                audioRecord = AudioRecord(
+                    MediaRecorder.AudioSource.MIC,
                     SAMPLE_RATE,
                     AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT,
                     bufferSize
                 )
-                if (candidate.state == AudioRecord.STATE_INITIALIZED) {
-                    record = candidate
-                    break
-                } else {
-                    candidate.release()
-                }
-            } catch (_: Exception) {}
-        }
-
-        if (record == null) return
-        audioRecord = record
-
-        isRecording = true
-        synchronized(bitBuffer) { bitBuffer.clear() }
-        record.startRecording()
-
-        workerThread = Thread {
-            val audioBuffer = ShortArray(windowSize)
-            while (isRecording) {
-                val read = audioRecord?.read(audioBuffer, 0, windowSize) ?: 0
-                if (read == windowSize) {
-                    processAudioWindow(audioBuffer)
-                }
             }
-        }.apply { start() }
+
+            audioRecord?.startRecording()
+            isRecording = true
+            bitBuffer.clear()
+
+            workerThread = Thread({ processAudioLoop() }, "AcousticDemodulatorThread").apply {
+                priority = Thread.MAX_PRIORITY
+                start()
+            }
+        } catch (_: SecurityException) {
+            // Handled via permission callback in UI
+        }
     }
 
-    private fun processAudioWindow(samples: ShortArray) {
-        val currentCoeffs = coeffs
-        val energies = DoubleArray(currentCoeffs.size) { i ->
-            goertzelEnergy(samples, currentCoeffs[i])
-        }
+    fun stopListening() {
+        isRecording = false
+        try {
+            audioRecord?.stop()
+            audioRecord?.release()
+            audioRecord = null
+            workerThread?.interrupt()
+            workerThread = null
+        } catch (_: Exception) {}
+    }
 
-        var maxEnergy = 0.0
-        var maxIdx = 0
+    private fun processAudioLoop() {
+        val readBuffer = ShortArray(windowSize)
+        while (isRecording) {
+            var readCount = 0
+            while (readCount < windowSize && isRecording) {
+                val read = audioRecord?.read(readBuffer, readCount, windowSize - readCount) ?: -1
+                if (read > 0) {
+                    readCount += read
+                } else {
+                    break
+                }
+            }
+
+            if (readCount == windowSize && isRecording) {
+                demodulateBlock(readBuffer)
+            }
+        }
+    }
+
+    private fun demodulateBlock(samples: ShortArray) {
+        val mode = activeMode
+        val numFreqs = mode.frequenciesHz.size
+        val energies = DoubleArray(numFreqs)
+        var maxEnergy = -1.0
+        var bestSym = 0
         var totalEnergy = 0.0
-        for (i in energies.indices) {
-            val e = energies[i]
+
+        for (i in 0 until numFreqs) {
+            val e = goertzelEnergy(samples, coeffs[i])
+            energies[i] = e
             totalEnergy += e
             if (e > maxEnergy) {
                 maxEnergy = e
-                maxIdx = i
+                bestSym = i
             }
         }
 
-        val noiseFloor = 1.0e5
-        val avgNoise = if (energies.size > 1) (totalEnergy - maxEnergy) / (energies.size - 1) else noiseFloor
-        val snrDb = if (avgNoise > 0 && maxEnergy > avgNoise) {
-            (10.0 * log10(maxEnergy / avgNoise)).toFloat()
+        val noiseEnergy = (totalEnergy - maxEnergy).coerceAtLeast(1.0) / (numFreqs - 1).coerceAtLeast(1)
+        val snrDb = if (noiseEnergy > 0.0 && maxEnergy > 0.0) {
+            (10.0 * log10(maxEnergy / noiseEnergy)).toFloat()
         } else 0f
 
-        onAudioEnergyUpdate?.invoke(totalEnergy.toFloat(), snrDb)
+        onAudioEnergyUpdate?.invoke(maxEnergy.toFloat(), snrDb)
 
-        if (maxEnergy > noiseFloor && snrDb >= 2.0f) {
-            // Demodulate symbol value (0 until 2^bitsPerSymbol)
-            val bitsPerSymbol = activeMode.bitsPerSymbol
-            for (b in (bitsPerSymbol - 1) downTo 0) {
-                val bit = (maxIdx shr b) and 1
-                synchronized(bitBuffer) {
-                    bitBuffer.add(bit)
-                }
-            }
-            checkAndDecodePacket()
+        if (isAdaptiveEnabled) {
+            adaptiveController.updateSnr(snrDb)
         }
+
+        // Add bits corresponding to the detected symbol (bitsPerSymbol)
+        val bits = mode.bitsPerSymbol
+        for (b in bits - 1 downTo 0) {
+            bitBuffer.add((bestSym shr b) and 1)
+        }
+
+        checkAndDecodePacket()
     }
 
     private fun goertzelEnergy(samples: ShortArray, coeff: Double): Double {
@@ -160,58 +258,63 @@ class AudioFskDemodulator(
 
     @Synchronized
     private fun checkAndDecodePacket() {
-        val syncIdx = synchronizer.findSyncIndex(bitBuffer)
-        if (syncIdx == -1) {
+        val syncResult = synchronizer.findSyncIndex(bitBuffer)
+        if (syncResult == null) {
             if (bitBuffer.size > 2048) {
                 bitBuffer.subList(0, 512).clear()
             }
             return
         }
 
-        val payloadStartBit = syncIdx + synchronizer.syncLengthBits
-        // Read 1-byte modeId (8 bits)
-        if (bitBuffer.size < payloadStartBit + 8) return
+        val (payloadStartBit, _) = syncResult
 
-        val modeByte = extractByte(payloadStartBit)
-        if (modeByte.toInt() !in 0..2) return
-        val packetStartBit = payloadStartBit + 8
+        // 24-byte wire header is encoded with Hamming(8,4) into 48 bytes (384 bits)
+        val encodedHeaderBits = Packet.HEADER_SIZE * 2 * 8 // 384 bits
+        if (bitBuffer.size < payloadStartBit + encodedHeaderBits) return
 
-        // Wire format v2 header is 24 bytes (192 bits)
-        if (bitBuffer.size < packetStartBit + Packet.HEADER_SIZE * 8) return
+        val encodedHeaderBytes = extractBytes(payloadStartBit, Packet.HEADER_SIZE * 2) ?: return
+        val headerFec = FecCodec.decodeBytes(encodedHeaderBytes)
 
-        val headerBytes = extractBytes(packetStartBit, Packet.HEADER_SIZE) ?: return
-
-        // In 24-byte wire frame: bytes 14 and 15 are uint16 payloadLength
-        val pLen = ((headerBytes[14].toInt() and 0xFF) shl 8) or (headerBytes[15].toInt() and 0xFF)
-        if (pLen > 1024) {
-            // Malformed length, discard false sync
-            bitBuffer.subList(0, syncIdx + 1).clear()
+        if (!headerFec.isClean) {
+            // Uncorrectable double-bit error in header!
+            onFecTelemetry?.invoke(headerFec.singleBitCorrections, headerFec.uncorrectableErrors)
+            bitBuffer.subList(0, payloadStartBit).clear()
             return
         }
 
-        val totalExpectedBits = (Packet.HEADER_SIZE + pLen) * 8
-        if (bitBuffer.size >= packetStartBit + totalExpectedBits) {
-            val fullPacketBytes = extractBytes(packetStartBit, Packet.HEADER_SIZE + pLen)
-            if (fullPacketBytes != null) {
+        val decodedHeader = headerFec.decodedBytes
+        // Bytes 14 and 15 are uint16 payloadLength
+        val pLen = ((decodedHeader[14].toInt() and 0xFF) shl 8) or (decodedHeader[15].toInt() and 0xFF)
+        if (pLen > 1024) {
+            bitBuffer.subList(0, payloadStartBit).clear()
+            return
+        }
+
+        val totalEncodedBytes = (Packet.HEADER_SIZE + pLen) * 2
+        val totalExpectedBits = totalEncodedBytes * 8
+
+        if (bitBuffer.size >= payloadStartBit + totalExpectedBits) {
+            val fullEncodedBytes = extractBytes(payloadStartBit, totalEncodedBytes)
+            if (fullEncodedBytes != null) {
+                val fullFec = FecCodec.decodeBytes(fullEncodedBytes)
+                onFecTelemetry?.invoke(fullFec.singleBitCorrections, fullFec.uncorrectableErrors)
+
+                if (!fullFec.isClean) {
+                    // Double bit error detected: do not trust, discard corrupted packet
+                    bitBuffer.subList(0, payloadStartBit).clear()
+                    return
+                }
+
                 try {
-                    val packet = Packet.deserialize(fullPacketBytes)
+                    val packet = Packet.deserialize(fullFec.decodedBytes)
                     onPacketDecoded(packet)
-                    val removeUpTo = minOf(bitBuffer.size, packetStartBit + totalExpectedBits)
+                    val removeUpTo = minOf(bitBuffer.size, payloadStartBit + totalExpectedBits)
                     bitBuffer.subList(0, removeUpTo).clear()
                 } catch (_: Exception) {
-                    // CRC or framing error, advance past this sync
-                    bitBuffer.subList(0, syncIdx + 1).clear()
+                    bitBuffer.subList(0, payloadStartBit).clear()
                 }
             }
         }
-    }
-
-    private fun extractByte(startBit: Int): Int {
-        var b = 0
-        for (i in 0 until 8) {
-            b = (b shl 1) or bitBuffer[startBit + i]
-        }
-        return b
     }
 
     private fun extractBytes(startBit: Int, numBytes: Int): ByteArray? {
@@ -219,23 +322,12 @@ class AudioFskDemodulator(
         val bytes = ByteArray(numBytes)
         for (byteIdx in 0 until numBytes) {
             var b = 0
-            for (bitOffset in 0 until 8) {
-                b = (b shl 1) or bitBuffer[startBit + byteIdx * 8 + bitOffset]
+            val offset = startBit + byteIdx * 8
+            for (i in 0 until 8) {
+                b = (b shl 1) or bitBuffer[offset + i]
             }
             bytes[byteIdx] = b.toByte()
         }
         return bytes
-    }
-
-    fun stopListening() {
-        isRecording = false
-        workerThread?.interrupt()
-        workerThread = null
-        try {
-            audioRecord?.stop()
-            audioRecord?.release()
-        } catch (_: Exception) {}
-        audioRecord = null
-        synchronized(bitBuffer) { bitBuffer.clear() }
     }
 }

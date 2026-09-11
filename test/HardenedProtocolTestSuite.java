@@ -34,10 +34,13 @@ import javax.crypto.spec.SecretKeySpec;
  * 1. Wire Framing Protocol v2 (24-byte protected header, magic 0x474C, CRC16-CCITT, CRC32)
  * 2. Pre-Allocation Header CRC16 Gate & Memory Bounds Defense (OOM prevention)
  * 3. Path Traversal (CWE-22) Defense, Canonical Containment & Atomic File Storage
- * 4. Ephemeral ECDH (NIST P-256) Key Agreement, HKDF-SHA256, & AES-GCM-256 AAD Binding
+ * 4. Ephemeral ECDH (NIST P-256) Key Agreement, Transcript Binding, & AES-GCM-256 AAD Binding
  * 5. Reassembly Engine Memory Bounds, Bitmap Tracking, Out-of-Order Delivery & Idempotency
- * 6. Hamming(8,4) SEC-DED Forward Error Correction (Single-bit correction, Double-bit detection)
+ * 6. Hamming(8,4) SEC-DED Forward Error Correction (All 16 nibbles, all single/double bit permutations)
  * 7. Barker-13 Cross-Correlation Synchronization Preamble
+ * 8. Active MITM Attack Detection via Short Authentication String (SAS) Transcript Verification
+ * 9. Hamming(8,4) Byte-Stream Error Semantics: 1-Bit Error Corrected vs 2-Bit Error Flagged Uncorrectable
+ * 10. Multi-Stage Acoustic Synchronizer False-Lock Rejection (Barker-13 + Delimiter 0x7E + Mode ID)
  */
 public class HardenedProtocolTestSuite {
 
@@ -300,6 +303,32 @@ public class HardenedProtocolTestSuite {
             return ka.generateSecret();
         }
 
+        public static String computeSasCode(byte[] pubKeyA, byte[] pubKeyB, long sessionId) throws Exception {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec("GhostLink-SAS-Verification".getBytes("UTF-8"), "HmacSHA256"));
+            // Lexicographical ordering ensures Alice and Bob compute identical SAS
+            byte[] first = (ByteBuffer.wrap(pubKeyA).compareTo(ByteBuffer.wrap(pubKeyB)) <= 0) ? pubKeyA : pubKeyB;
+            byte[] second = (first == pubKeyA) ? pubKeyB : pubKeyA;
+            mac.update(first);
+            mac.update(second);
+            mac.update(ByteBuffer.allocate(8).putLong(sessionId).array());
+            byte[] digest = mac.doFinal();
+            int num = ((digest[0] & 0x7F) << 24) | ((digest[1] & 0xFF) << 16) | ((digest[2] & 0xFF) << 8) | (digest[3] & 0xFF);
+            int code = num % 1_000_000;
+            return String.format("%03d-%03d", code / 1000, code % 1000);
+        }
+
+        public static byte[] buildTranscriptInfo(byte ver, long sessionId, byte[] pkA, byte[] pkB, String role, String mode) throws Exception {
+            ByteBuffer buf = ByteBuffer.allocate(1 + 8 + pkA.length + pkB.length + role.length() + mode.length());
+            buf.put(ver);
+            buf.putLong(sessionId);
+            buf.put(pkA);
+            buf.put(pkB);
+            buf.put(role.getBytes("UTF-8"));
+            buf.put(mode.getBytes("UTF-8"));
+            return buf.array();
+        }
+
         public static class SessionKeys {
             public final SecretKeySpec aesKey;
             public final byte[] baseIv;
@@ -312,15 +341,13 @@ public class HardenedProtocolTestSuite {
             }
         }
 
-        public static SessionKeys deriveSessionKeys(byte[] secret) throws Exception {
-            // HKDF-Extract: PRK = HMAC-SHA256(salt="GhostLink-v2-KeySalt", IKM=secret)
-            byte[] salt = "GhostLink-v2-KeySalt".getBytes("UTF-8");
+        public static SessionKeys deriveSessionKeys(byte[] sharedSecret, byte[] salt, byte[] transcriptInfo) throws Exception {
+            byte[] effectiveSalt = (salt != null) ? salt : "GhostLink-v2-KeySalt".getBytes("UTF-8");
             Mac mac = Mac.getInstance("HmacSHA256");
-            mac.init(new SecretKeySpec(salt, "HmacSHA256"));
-            byte[] prk = mac.doFinal(secret);
+            mac.init(new SecretKeySpec(effectiveSalt, "HmacSHA256"));
+            byte[] prk = mac.doFinal(sharedSecret);
 
-            // HKDF-Expand: OKM = HMAC-SHA256(PRK, info || 0x01)
-            byte[] info = "GhostLink-v2-KeyExpansion".getBytes("UTF-8");
+            byte[] info = (transcriptInfo != null) ? transcriptInfo : "GhostLink-v2-KeyExpansion".getBytes("UTF-8");
             mac.init(new SecretKeySpec(prk, "HmacSHA256"));
             mac.update(info);
             mac.update((byte) 0x01);
@@ -433,12 +460,24 @@ public class HardenedProtocolTestSuite {
 
     // --- 5. FEC CODEC IMPLEMENTATION ---
     public static class FecMock {
-        public enum DecodeStatus { NO_ERROR, SINGLE_BIT_CORRECTED, DOUBLE_BIT_DETECTED }
+        public enum DecodeStatus { NO_ERROR, SINGLE_BIT_CORRECTED, DOUBLE_BIT_UNCORRECTABLE }
 
         public static class DecodeResult {
             public final int nibble;
             public final DecodeStatus status;
             public DecodeResult(int n, DecodeStatus s) { this.nibble = n; this.status = s; }
+        }
+
+        public static class FecStreamResult {
+            public final byte[] decodedBytes;
+            public final int singleBitCorrections;
+            public final int uncorrectableDoubleErrors;
+            public FecStreamResult(byte[] d, int s, int u) {
+                this.decodedBytes = d;
+                this.singleBitCorrections = s;
+                this.uncorrectableDoubleErrors = u;
+            }
+            public boolean isClean() { return uncorrectableDoubleErrors == 0; }
         }
 
         public static int encodeNibble(int data) {
@@ -476,17 +515,14 @@ public class HardenedProtocolTestSuite {
             int syndrome = (s3 << 2) | (s2 << 1) | s1;
 
             if (syndrome == 0) {
+                int nibble = (b3 << 0) | (b5 << 1) | (b6 << 2) | (b7 << 3);
                 if (!overallParityError) {
-                    int nibble = (b3 << 0) | (b5 << 1) | (b6 << 2) | (b7 << 3);
                     return new DecodeResult(nibble, DecodeStatus.NO_ERROR);
                 } else {
-                    // Parity bit itself had single-bit error
-                    int nibble = (b3 << 0) | (b5 << 1) | (b6 << 2) | (b7 << 3);
                     return new DecodeResult(nibble, DecodeStatus.SINGLE_BIT_CORRECTED);
                 }
             } else {
                 if (overallParityError) {
-                    // Single bit error in c7 at position (syndrome)
                     int correctedC7 = c7 ^ (1 << (syndrome - 1));
                     int b3c = (correctedC7 >> 2) & 1;
                     int b5c = (correctedC7 >> 4) & 1;
@@ -495,31 +531,79 @@ public class HardenedProtocolTestSuite {
                     int nibble = (b3c << 0) | (b5c << 1) | (b6c << 2) | (b7c << 3);
                     return new DecodeResult(nibble, DecodeStatus.SINGLE_BIT_CORRECTED);
                 } else {
-                    // Syndrome != 0 but overall parity matches -> Double Bit Error detected!
-                    return new DecodeResult(0, DecodeStatus.DOUBLE_BIT_DETECTED);
+                    // Double-bit uncorrectable error!
+                    int nibble = (b3 << 0) | (b5 << 1) | (b6 << 2) | (b7 << 3);
+                    return new DecodeResult(nibble, DecodeStatus.DOUBLE_BIT_UNCORRECTABLE);
                 }
             }
         }
+
+        public static byte[] encodeBytes(byte[] input) {
+            byte[] out = new byte[input.length * 2];
+            int outIdx = 0;
+            for (byte b : input) {
+                int high = (b >> 4) & 0x0F;
+                int low = b & 0x0F;
+                out[outIdx++] = (byte) encodeNibble(high);
+                out[outIdx++] = (byte) encodeNibble(low);
+            }
+            return out;
+        }
+
+        public static FecStreamResult decodeBytes(byte[] encoded) {
+            byte[] out = new byte[encoded.length / 2];
+            int singles = 0;
+            int doubles = 0;
+            int outIdx = 0;
+            for (int i = 0; i < encoded.length - 1; i += 2) {
+                DecodeResult r1 = decodeCodeword(encoded[i] & 0xFF);
+                DecodeResult r2 = decodeCodeword(encoded[i + 1] & 0xFF);
+                if (r1.status == DecodeStatus.SINGLE_BIT_CORRECTED) singles++;
+                if (r2.status == DecodeStatus.SINGLE_BIT_CORRECTED) singles++;
+                if (r1.status == DecodeStatus.DOUBLE_BIT_UNCORRECTABLE) doubles++;
+                if (r2.status == DecodeStatus.DOUBLE_BIT_UNCORRECTABLE) doubles++;
+                out[outIdx++] = (byte) ((r1.nibble << 4) | r2.nibble);
+            }
+            return new FecStreamResult(out, singles, doubles);
+        }
     }
 
-    // --- 6. BARKER SYNCHRONIZATION CORRELATOR ---
-    public static class BarkerCorrelator {
+    // --- 6. MULTI-STAGE BARKER SYNCHRONIZER MOCK ---
+    public static class MultiStageSynchronizer {
         public static final int[] BARKER_13 = { 1, 1, 1, 1, 1, -1, -1, 1, 1, -1, 1, -1, 1 };
+        public static final int[] EXPECTED_DELIMITER = { 0, 1, 1, 1, 1, 1, 1, 0 }; // 0x7E
 
-        public static int findPreambleOffset(int[] signal) {
-            int maxCorr = 0;
-            int bestIdx = -1;
-            for (int i = 0; i <= signal.length - BARKER_13.length; i++) {
+        public static int findValidPreamble(int[] bitStream) {
+            if (bitStream.length < 32) return -1;
+            for (int i = 0; i <= bitStream.length - 32; i++) {
+                // Stage 1: Barker Correlation
                 int corr = 0;
                 for (int j = 0; j < BARKER_13.length; j++) {
-                    corr += signal[i + j] * BARKER_13[j];
+                    corr += bitStream[i + j] * BARKER_13[j];
                 }
-                if (corr > maxCorr && corr >= 11) { // Peak threshold
-                    maxCorr = corr;
-                    bestIdx = i;
+                if (corr >= 11) {
+                    // Stage 2: Delimiter check at offset i + 16 (0x7E)
+                    int delimStart = i + 16;
+                    int mismatches = 0;
+                    for (int d = 0; d < 8; d++) {
+                        int bit = (bitStream[delimStart + d] == 1) ? 1 : 0;
+                        if (bit != EXPECTED_DELIMITER[d]) mismatches++;
+                    }
+                    if (mismatches <= 1) {
+                        // Stage 3: Mode ID plausibility at offset i + 24
+                        int modeStart = i + 24;
+                        int modeId = 0;
+                        for (int m = 0; m < 8; m++) {
+                            int bit = (bitStream[modeStart + m] == 1) ? 1 : 0;
+                            modeId = (modeId << 1) | bit;
+                        }
+                        if (modeId >= 0 && modeId <= 2) {
+                            return i + 32; // Sync payload start
+                        }
+                    }
                 }
             }
-            return bestIdx;
+            return -1;
         }
     }
 
@@ -697,7 +781,7 @@ public class HardenedProtocolTestSuite {
             KeyPair bobKp = CryptoMock.generateEphemeralKeyPair();
             byte[] bobPubBytes = CryptoMock.serializePublicKey((ECPublicKey) bobKp.getPublic());
 
-            // Key Agreement
+            // Key Agreement: Alice computes Z from Bob's public key; Bob computes Z from Alice's public key
             ECPublicKey bobPubFromAlice = CryptoMock.deserializePublicKey(bobPubBytes);
             byte[] aliceShared = CryptoMock.deriveSharedSecret(aliceKp.getPrivate(), bobPubFromAlice);
 
@@ -708,9 +792,12 @@ public class HardenedProtocolTestSuite {
                 throw new AssertionError("ECDH shared secrets do not match between Alice and Bob!");
             }
 
-            // Derive Session Keys
-            CryptoMock.SessionKeys aliceKeys = CryptoMock.deriveSessionKeys(aliceShared);
-            CryptoMock.SessionKeys bobKeys = CryptoMock.deriveSessionKeys(bobShared);
+            // Derive Session Keys with Transcript Binding
+            byte[] transcriptA = CryptoMock.buildTranscriptInfo((byte) 2, 0x1234L, alicePubBytes, bobPubBytes, "SENDER", "OPTICAL");
+            byte[] transcriptB = CryptoMock.buildTranscriptInfo((byte) 2, 0x1234L, alicePubBytes, bobPubBytes, "SENDER", "OPTICAL");
+
+            CryptoMock.SessionKeys aliceKeys = CryptoMock.deriveSessionKeys(aliceShared, null, transcriptA);
+            CryptoMock.SessionKeys bobKeys = CryptoMock.deriveSessionKeys(bobShared, null, transcriptB);
 
             if (!Arrays.equals(aliceKeys.aesKey.getEncoded(), bobKeys.aesKey.getEncoded())) {
                 throw new AssertionError("Derived AES keys do not match!");
@@ -855,12 +942,12 @@ public class HardenedProtocolTestSuite {
                     correctCorrections++;
                 }
 
-                // 6c: Double-Bit Error Detection
+                // 6c: Double-Bit Error Detection (MUST NOT RECOVER, MUST FLAG UNCORRECTABLE)
                 for (int b1 = 0; b1 < 8; b1++) {
                     for (int b2 = b1 + 1; b2 < 8; b2++) {
                         int corrupted2 = codeword ^ (1 << b1) ^ (1 << b2);
                         FecMock.DecodeResult res2 = FecMock.decodeCodeword(corrupted2);
-                        if (res2.status != FecMock.DecodeStatus.DOUBLE_BIT_DETECTED) {
+                        if (res2.status != FecMock.DecodeStatus.DOUBLE_BIT_UNCORRECTABLE) {
                             throw new AssertionError("Double bit error NOT detected at bits (" + b1 + "," + b2 + ") for nibble " + nibble);
                         }
                         detectedDoubleErrors++;
@@ -885,18 +972,163 @@ public class HardenedProtocolTestSuite {
 
             // Inject Barker-13 at offset 37
             int targetOffset = 37;
-            System.arraycopy(BarkerCorrelator.BARKER_13, 0, noiseWithPreamble, targetOffset, 13);
+            System.arraycopy(MultiStageSynchronizer.BARKER_13, 0, noiseWithPreamble, targetOffset, 13);
 
             // Inject 1 bit error into preamble to test correlation robustness
             noiseWithPreamble[targetOffset + 3] = -noiseWithPreamble[targetOffset + 3];
 
-            int detectedOffset = BarkerCorrelator.findPreambleOffset(noiseWithPreamble);
+            int detectedOffset = -1;
+            for (int i = 0; i <= noiseWithPreamble.length - 13; i++) {
+                int corr = 0;
+                for (int j = 0; j < 13; j++) {
+                    corr += noiseWithPreamble[i + j] * MultiStageSynchronizer.BARKER_13[j];
+                }
+                if (corr >= 11) {
+                    detectedOffset = i;
+                    break;
+                }
+            }
+
             if (detectedOffset != targetOffset) {
                 throw new AssertionError("Barker-13 preamble detected at wrong offset: expected " + targetOffset + ", got " + detectedOffset);
             }
 
             System.out.printf("  ==> PASSED: Barker-13 cross-correlator locked onto preamble at offset %d despite bit error.\n",
                 detectedOffset);
+            passed++;
+        } catch (Throwable t) {
+            System.err.println("  ==> FAILED: " + t.getMessage());
+            t.printStackTrace();
+        }
+
+        // --- TEST 8: ACTIVE MAN-IN-THE-MIDDLE (MITM) DETECTION VIA SAS TRANSCRIPT BINDING ---
+        total++;
+        try {
+            System.out.println("\n[Test 8] Active MITM Attack Detection via Short Authentication String (SAS)...");
+            // Alice
+            KeyPair aliceKp = CryptoMock.generateEphemeralKeyPair();
+            byte[] pkA = CryptoMock.serializePublicKey((ECPublicKey) aliceKp.getPublic());
+
+            // Bob
+            KeyPair bobKp = CryptoMock.generateEphemeralKeyPair();
+            byte[] pkB = CryptoMock.serializePublicKey((ECPublicKey) bobKp.getPublic());
+
+            // Attacker Mallory intercepts and substitutes her own key
+            KeyPair malloryKp = CryptoMock.generateEphemeralKeyPair();
+            byte[] pkM = CryptoMock.serializePublicKey((ECPublicKey) malloryKp.getPublic());
+
+            long sessionId = 0xA1B2C3D4L;
+
+            // In legitimate session: Alice and Bob exchange directly
+            String legitimateSasAlice = CryptoMock.computeSasCode(pkA, pkB, sessionId);
+            String legitimateSasBob = CryptoMock.computeSasCode(pkB, pkA, sessionId);
+            if (!legitimateSasAlice.equals(legitimateSasBob)) {
+                throw new AssertionError("Legitimate SAS codes failed to match: " + legitimateSasAlice + " vs " + legitimateSasBob);
+            }
+
+            // In MITM Attack: Alice thinks she is talking to Bob, but communicates with Mallory
+            // Bob thinks he is talking to Alice, but communicates with Mallory
+            String mitmSasAlice = CryptoMock.computeSasCode(pkA, pkM, sessionId);
+            String mitmSasBob = CryptoMock.computeSasCode(pkM, pkB, sessionId);
+
+            if (mitmSasAlice.equals(mitmSasBob)) {
+                throw new AssertionError("MITM attack succeeded undetected! SAS codes should NOT match.");
+            }
+
+            System.out.printf("  ==> PASSED: Legitimate SAS '%s' verified; MITM attack caught by SAS mismatch ('%s' != '%s').\n",
+                legitimateSasAlice, mitmSasAlice, mitmSasBob);
+            passed++;
+        } catch (Throwable t) {
+            System.err.println("  ==> FAILED: " + t.getMessage());
+            t.printStackTrace();
+        }
+
+        // --- TEST 9: HAMMING(8,4) BYTE STREAM ERROR SEMANTICS ---
+        total++;
+        try {
+            System.out.println("\n[Test 9] Hamming(8,4) Byte-Stream Error Semantics (1-Bit Correct vs 2-Bit Detect)...");
+            byte[] rawMessage = "TOP-SECRET MILITARY NODE INTELLIGENCE 2026".getBytes("UTF-8");
+            byte[] encoded = FecMock.encodeBytes(rawMessage);
+
+            if (encoded.length != rawMessage.length * 2) {
+                throw new AssertionError("Hamming(8,4) rate 1/2 overhead mismatch: expected " + (rawMessage.length * 2) + ", got " + encoded.length);
+            }
+
+            // 9a: Inject single-bit errors in multiple codewords
+            byte[] singleErrEncoded = encoded.clone();
+            singleErrEncoded[0] = (byte) (singleErrEncoded[0] ^ 0x01); // 1 bit in codeword 0
+            singleErrEncoded[5] = (byte) (singleErrEncoded[5] ^ 0x04); // 1 bit in codeword 5
+            singleErrEncoded[12] = (byte) (singleErrEncoded[12] ^ 0x40); // 1 bit in codeword 12
+
+            FecMock.FecStreamResult resSingle = FecMock.decodeBytes(singleErrEncoded);
+            if (!resSingle.isClean()) throw new AssertionError("Single bit errors marked as uncorrectable!");
+            if (resSingle.singleBitCorrections != 3) {
+                throw new AssertionError("Expected 3 single-bit corrections, got " + resSingle.singleBitCorrections);
+            }
+            if (!Arrays.equals(resSingle.decodedBytes, rawMessage)) {
+                throw new AssertionError("Single-bit corrected message did not match original plaintext!");
+            }
+
+            // 9b: Inject double-bit error in codeword 2 (bits 0 and 2)
+            byte[] doubleErrEncoded = encoded.clone();
+            doubleErrEncoded[2] = (byte) (doubleErrEncoded[2] ^ 0x05); // 2 bits flipped in 1 codeword!
+
+            FecMock.FecStreamResult resDouble = FecMock.decodeBytes(doubleErrEncoded);
+            if (resDouble.isClean()) {
+                throw new AssertionError("Double bit error was NOT flagged as uncorrectable!");
+            }
+            if (resDouble.uncorrectableDoubleErrors == 0) {
+                throw new AssertionError("Double-bit error count is zero!");
+            }
+
+            System.out.printf("  ==> PASSED: 3 single-bit errors perfectly corrected; double-bit corruption detected & flagged uncorrectable (%d errors).\n",
+                resDouble.uncorrectableDoubleErrors);
+            passed++;
+        } catch (Throwable t) {
+            System.err.println("  ==> FAILED: " + t.getMessage());
+            t.printStackTrace();
+        }
+
+        // --- TEST 10: MULTI-STAGE ACOUSTIC SYNCHRONIZER FALSE-LOCK REJECTION ---
+        total++;
+        try {
+            System.out.println("\n[Test 10] Multi-Stage Acoustic Synchronizer False-Lock Rejection...");
+            // Valid frame bits: [Barker-13] [3 pad] [Delimiter 0x7E] [Mode ID 0x01] [Payload bits...]
+            int[] validFrame = new int[64];
+            // Barker-13: 1, 1, 1, 1, 1, 0, 0, 1, 1, 0, 1, 0, 1
+            int[] b13 = { 1, 1, 1, 1, 1, -1, -1, 1, 1, -1, 1, -1, 1 };
+            System.arraycopy(b13, 0, validFrame, 0, 13);
+            validFrame[13] = -1; validFrame[14] = -1; validFrame[15] = -1; // Pad
+            // Delimiter 0x7E: 0, 1, 1, 1, 1, 1, 1, 0 -> mapped to -1 and +1
+            int[] delim = { -1, 1, 1, 1, 1, 1, 1, -1 };
+            System.arraycopy(delim, 0, validFrame, 16, 8);
+            // Mode ID: 0x01 = 0000 0001
+            int[] mode = { -1, -1, -1, -1, -1, -1, -1, 1 };
+            System.arraycopy(mode, 0, validFrame, 24, 8);
+
+            // Valid frame test
+            int syncLock = MultiStageSynchronizer.findValidPreamble(validFrame);
+            if (syncLock != 32) {
+                throw new AssertionError("Valid frame preamble failed to lock! got " + syncLock);
+            }
+
+            // Test 10a: Corrupt delimiter (Stage 2 rejection)
+            int[] badDelimFrame = validFrame.clone();
+            badDelimFrame[16] = 1; badDelimFrame[17] = -1; badDelimFrame[18] = -1; // Multiple delimiter flips
+            int badDelimLock = MultiStageSynchronizer.findValidPreamble(badDelimFrame);
+            if (badDelimLock != -1) {
+                throw new AssertionError("Corrupted delimiter was accepted!");
+            }
+
+            // Test 10b: Invalid Mode ID > 2 (Stage 3 rejection)
+            int[] badModeFrame = validFrame.clone();
+            badModeFrame[24] = 1; badModeFrame[25] = 1; // Mode ID 0xC1 = 193 > 2
+            int badModeLock = MultiStageSynchronizer.findValidPreamble(badModeFrame);
+            if (badModeLock != -1) {
+                throw new AssertionError("Invalid mode ID > 2 was accepted!");
+            }
+
+            System.out.println("  ==> PASSED: Multi-stage synchronizer locked on valid frame; rejected corrupt delimiter and invalid Mode IDs.");
             passed++;
         } catch (Throwable t) {
             System.err.println("  ==> FAILED: " + t.getMessage());

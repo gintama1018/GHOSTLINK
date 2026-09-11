@@ -4,9 +4,31 @@ package com.ghostlink.zerorf.channels.ultrasonic.modem
  * Forward Error Correction (FEC) Codec implementing Hamming(8,4) SEC-DED
  * (Single Error Correction, Double Error Detection).
  *
- * Corrects single-bit errors per nibble caused by room reverberation / acoustic multipath.
+ * Mathematically proven:
+ * - 1-bit error  -> CORRECT (exact original recovery)
+ * - 2-bit error  -> DETECT (flags uncorrectable error; payload marked untrusted)
+ * - Overhead     -> Rate 1/2 (halves raw payload efficiency: 2 codewords per byte)
  */
 object FecCodec {
+
+    enum class DecodeStatus {
+        NO_ERROR,
+        SINGLE_BIT_CORRECTED,
+        DOUBLE_BIT_UNCORRECTABLE
+    }
+
+    data class NibbleResult(
+        val data: Int,
+        val status: DecodeStatus
+    )
+
+    data class FecResult(
+        val decodedBytes: ByteArray,
+        val singleBitCorrections: Int,
+        val uncorrectableErrors: Int
+    ) {
+        val isClean: Boolean get() = uncorrectableErrors == 0
+    }
 
     /**
      * Encodes 4 data bits (nibble 0..15) into an 8-bit Hamming codeword.
@@ -21,16 +43,16 @@ object FecCodec {
         val p2 = d0 xor d2 xor d3
         val p3 = d1 xor d2 xor d3
 
-        var codeword7 = (d3 shl 6) or (d2 shl 5) or (d1 shl 4) or (p3 shl 3) or (d0 shl 2) or (p2 shl 1) or p1
+        val codeword7 = (d3 shl 6) or (d2 shl 5) or (d1 shl 4) or (p3 shl 3) or (d0 shl 2) or (p2 shl 1) or p1
         val overallParity = Integer.bitCount(codeword7) % 2
         return (overallParity shl 7) or codeword7
     }
 
     /**
      * Decodes an 8-bit Hamming codeword back into a 4-bit nibble.
-     * Returns Pair(correctedData, wasCorrected).
+     * Enforces strict SEC-DED: corrects 1-bit flips, detects 2-bit flips.
      */
-    fun decodeNibble(codeword: Int): Pair<Int, Boolean> {
+    fun decodeNibble(codeword: Int): NibbleResult {
         val c = codeword and 0xFF
         val overallParityRx = (c shr 7) and 1
         var c7 = c and 0x7F
@@ -50,24 +72,37 @@ object FecCodec {
         val s3 = b4 xor b5 xor b6 xor b7
         val syndrome = (s3 shl 2) or (s2 shl 1) or s1
 
-        var wasCorrected = false
-        if (syndrome != 0) {
+        if (syndrome == 0) {
+            val d0 = (c7 shr 2) and 1
+            val d1 = (c7 shr 4) and 1
+            val d2 = (c7 shr 5) and 1
+            val d3 = (c7 shr 6) and 1
+            val nibble = (d3 shl 3) or (d2 shl 2) or (d1 shl 1) or d0
+            return if (!parityError) {
+                NibbleResult(nibble, DecodeStatus.NO_ERROR)
+            } else {
+                NibbleResult(nibble, DecodeStatus.SINGLE_BIT_CORRECTED)
+            }
+        } else {
             if (parityError) {
                 // Single bit error in c7 at position (syndrome - 1)
                 c7 = c7 xor (1 shl (syndrome - 1))
-                wasCorrected = true
+                val d0 = (c7 shr 2) and 1
+                val d1 = (c7 shr 4) and 1
+                val d2 = (c7 shr 5) and 1
+                val d3 = (c7 shr 6) and 1
+                val nibble = (d3 shl 3) or (d2 shl 2) or (d1 shl 1) or d0
+                return NibbleResult(nibble, DecodeStatus.SINGLE_BIT_CORRECTED)
+            } else {
+                // Syndrome != 0 and parity matches -> DOUBLE BIT ERROR! Uncorrectable!
+                val d0 = (c7 shr 2) and 1
+                val d1 = (c7 shr 4) and 1
+                val d2 = (c7 shr 5) and 1
+                val d3 = (c7 shr 6) and 1
+                val nibble = (d3 shl 3) or (d2 shl 2) or (d1 shl 1) or d0
+                return NibbleResult(nibble, DecodeStatus.DOUBLE_BIT_UNCORRECTABLE)
             }
-        } else if (parityError) {
-            // Parity bit itself had error
-            wasCorrected = true
         }
-
-        val d0 = (c7 shr 2) and 1
-        val d1 = (c7 shr 4) and 1
-        val d2 = (c7 shr 5) and 1
-        val d3 = (c7 shr 6) and 1
-        val nibble = (d3 shl 3) or (d2 shl 2) or (d1 shl 1) or d0
-        return Pair(nibble, wasCorrected)
     }
 
     /**
@@ -87,21 +122,25 @@ object FecCodec {
 
     /**
      * Decodes 2N FEC-protected bytes back into N raw bytes.
-     * Returns Pair(decodedBytes, totalErrorsCorrected).
+     * Accurately tracks single-bit corrections and uncorrectable double-bit errors.
      */
-    fun decodeBytes(encoded: ByteArray): Pair<ByteArray, Int> {
+    fun decodeBytes(encoded: ByteArray): FecResult {
         val out = ByteArray(encoded.size / 2)
-        var errors = 0
+        var singleBitCorrections = 0
+        var uncorrectableErrors = 0
         var outIdx = 0
         var i = 0
         while (i < encoded.size - 1) {
-            val (high, err1) = decodeNibble(encoded[i].toInt() and 0xFF)
-            val (low, err2) = decodeNibble(encoded[i + 1].toInt() and 0xFF)
-            if (err1) errors++
-            if (err2) errors++
-            out[outIdx++] = ((high shl 4) or low).toByte()
+            val res1 = decodeNibble(encoded[i].toInt() and 0xFF)
+            val res2 = decodeNibble(encoded[i + 1].toInt() and 0xFF)
+            if (res1.status == DecodeStatus.SINGLE_BIT_CORRECTED) singleBitCorrections++
+            if (res2.status == DecodeStatus.SINGLE_BIT_CORRECTED) singleBitCorrections++
+            if (res1.status == DecodeStatus.DOUBLE_BIT_UNCORRECTABLE) uncorrectableErrors++
+            if (res2.status == DecodeStatus.DOUBLE_BIT_UNCORRECTABLE) uncorrectableErrors++
+
+            out[outIdx++] = ((res1.data shl 4) or res2.data).toByte()
             i += 2
         }
-        return Pair(out, errors)
+        return FecResult(out, singleBitCorrections, uncorrectableErrors)
     }
 }

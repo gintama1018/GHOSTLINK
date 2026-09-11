@@ -1,42 +1,67 @@
 package com.ghostlink.zerorf.channels.ultrasonic.modem
 
 /**
- * Real-time bit-level synchronizer utilizing cross-correlation against the Barker preamble.
+ * Multi-stage physical-layer synchronizer for acoustic frames.
+ *
+ * Employs:
+ * 1. Discrete Barker-13 cross-correlation: R(i) = sum(x[i+j] * B[j]) >= 11
+ * 2. Frame delimiter verification (0x7E) with <= 1 bit error tolerance
+ * 3. Mode ID plausibility check (0..2)
  */
 class AcousticSynchronizer {
 
-    private val syncBits = ArrayList<Int>().apply {
-        // Sync preamble: 0xA5 (10100101), 0x5A (01011010), 0x7E (01111110)
-        for (b in AcousticFramer.SYNC_PREAMBLE_BYTES) {
-            for (bitOffset in 7 downTo 0) {
-                add(((b.toInt() and 0xFF) shr bitOffset) and 1)
-            }
-        }
+    companion object {
+        // Barker-13 bipolar sequence: +1, +1, +1, +1, +1, -1, -1, +1, +1, -1, +1, -1, +1
+        val BARKER_13 = intArrayOf(1, 1, 1, 1, 1, -1, -1, 1, 1, -1, 1, -1, 1)
+        const val CORRELATION_THRESHOLD = 11 // Allows 1 bit error (13 - 2 = 11)
+        const val SYNC_TOTAL_BITS = 16 + 8 + 8 // 16 bits (Barker+pad) + 8 bits (delimiter) + 8 bits (modeId)
+        val EXPECTED_DELIMITER = intArrayOf(0, 1, 1, 1, 1, 1, 1, 0) // 0x7E
     }
 
     /**
-     * Finds the starting index of the synchronization preamble in bitBuffer.
-     * Returns -1 if not found. Allows up to 1 bit error for channel noise tolerance.
+     * Searches for valid synchronization preamble in incoming bitBuffer.
+     * Returns Pair(payloadStartBitIndex, modeId), or null if no valid lock.
      */
-    fun findSyncIndex(bitBuffer: List<Int>): Int {
-        val limit = bitBuffer.size - syncBits.size
-        if (limit < 0) return -1
+    fun findSyncIndex(bitBuffer: List<Int>): Pair<Int, Int>? {
+        if (bitBuffer.size < SYNC_TOTAL_BITS + 16) return null
 
+        val limit = bitBuffer.size - SYNC_TOTAL_BITS
         for (i in 0..limit) {
-            var mismatches = 0
-            for (j in syncBits.indices) {
-                if (bitBuffer[i + j] != syncBits[j]) {
-                    mismatches++
-                    if (mismatches > 1) break
+            // Stage 1: Barker-13 Cross-Correlation
+            var correlation = 0
+            for (j in BARKER_13.indices) {
+                val bitVal = if (bitBuffer[i + j] == 1) 1 else -1
+                correlation += bitVal * BARKER_13[j]
+            }
+
+            if (correlation >= CORRELATION_THRESHOLD) {
+                // Stage 2: Delimiter validation at i + 16 (0x7E = 01111110)
+                val delimiterStart = i + 16
+                var delimiterMismatches = 0
+                for (d in 0..7) {
+                    if (bitBuffer[delimiterStart + d] != EXPECTED_DELIMITER[d]) {
+                        delimiterMismatches++
+                    }
+                }
+
+                if (delimiterMismatches <= 1) {
+                    // Stage 3: Mode ID plausibility at i + 24
+                    val modeStart = i + 24
+                    var modeId = 0
+                    for (m in 0..7) {
+                        modeId = (modeId shl 1) or bitBuffer[modeStart + m]
+                    }
+
+                    if (modeId in 0..2) {
+                        val payloadStartBit = i + SYNC_TOTAL_BITS
+                        return Pair(payloadStartBit, modeId)
+                    }
                 }
             }
-            if (mismatches <= 1) {
-                return i
-            }
         }
-        return -1
+        return null
     }
 
-    val syncLengthBits: Int
-        get() = syncBits.size
+    val syncHeaderLengthBits: Int
+        get() = SYNC_TOTAL_BITS
 }

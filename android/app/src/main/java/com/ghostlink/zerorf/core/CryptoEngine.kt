@@ -94,23 +94,99 @@ object CryptoEngine {
         return ka.generateSecret()
     }
 
+    enum class SecurityLevel(val label: String) {
+        UNAUTHENTICATED_ECDH("ECDH Established (Eavesdrop Proof · Unauthenticated Peer)"),
+        CONTACT_BOUND_ECDH("ECDH + Physical Touch Binding (<2cm Contact)"),
+        SAS_AUTHENTICATED_ECDH("Peer Authenticated (SAS Transcript Verified)")
+    }
+
     /**
-     * Expands raw shared secret into SessionKeys via HKDF-SHA256.
+     * Builds domain-separated transcript info to prevent cross-protocol and role confusion attacks.
      */
-    fun deriveSessionKeys(sharedSecret: ByteArray): SessionKeys {
-        // 1. HKDF-Extract(salt, sharedSecret) -> PRK
+    fun buildTranscriptInfo(
+        protocolVersion: Byte = ProtocolConstants.WIRE_VERSION,
+        sessionId: Long,
+        senderPubKey: ByteArray,
+        receiverPubKey: ByteArray,
+        role: String = "TRANSCEIVER",
+        bulkMode: String = "OPTICAL"
+    ): ByteArray {
+        val roleBytes = role.toByteArray(Charsets.UTF_8)
+        val modeBytes = bulkMode.toByteArray(Charsets.UTF_8)
+        val buf = ByteBuffer.allocate(1 + 8 + senderPubKey.size + receiverPubKey.size + roleBytes.size + modeBytes.size)
+        buf.put(protocolVersion)
+        buf.putLong(sessionId)
+        buf.put(senderPubKey)
+        buf.put(receiverPubKey)
+        buf.put(roleBytes)
+        buf.put(modeBytes)
+        return buf.array()
+    }
+
+    /**
+     * Computes a 6-digit Short Authentication String (SAS) from the transcript of exchanged public keys.
+     * Both Sender and Receiver display this 6-digit code.
+     * If an active Man-in-the-Middle (MITM) injected different keys, the SAS codes will NOT match.
+     */
+    fun computeSasCode(pubKeyA: ByteArray, pubKeyB: ByteArray, sessionId: Long): String {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec("GhostLink-SAS-Verification".toByteArray(Charsets.UTF_8), "HmacSHA256"))
+        // Sort keys lexicographically so both Sender and Receiver get the identical SAS regardless of role
+        val (first, second) = if (ByteBuffer.wrap(pubKeyA).compareTo(ByteBuffer.wrap(pubKeyB)) <= 0) {
+            Pair(pubKeyA, pubKeyB)
+        } else {
+            Pair(pubKeyB, pubKeyA)
+        }
+        mac.update(first)
+        mac.update(second)
+        val sessionBytes = ByteBuffer.allocate(8).putLong(sessionId).array()
+        mac.update(sessionBytes)
+        val digest = mac.doFinal()
+        val num = ((digest[0].toInt() and 0x7F) shl 24) or
+                  ((digest[1].toInt() and 0xFF) shl 16) or
+                  ((digest[2].toInt() and 0xFF) shl 8) or
+                  (digest[3].toInt() and 0xFF)
+        val code = num % 1_000_000
+        return String.format("%03d-%03d", code / 1000, code % 1000)
+    }
+
+    /**
+     * Expands raw ECDH shared secret into SessionKeys via HKDF-SHA256 with transcript binding.
+     * Optionally mixes in physical contact salt from magnetic induction.
+     */
+    fun deriveSessionKeys(
+        sharedSecret: ByteArray,
+        salt: ByteArray? = null,
+        transcriptInfo: ByteArray? = null
+    ): SessionKeys {
+        // 1. HKDF-Extract(salt ?: HKDF_SALT, sharedSecret) -> PRK
+        val effectiveSalt = salt ?: HKDF_SALT
         val hmacExtract = Mac.getInstance("HmacSHA256")
-        hmacExtract.init(SecretKeySpec(HKDF_SALT, "HmacSHA256"))
+        hmacExtract.init(SecretKeySpec(effectiveSalt, "HmacSHA256"))
         val prk = hmacExtract.doFinal(sharedSecret)
 
-        // 2. HKDF-Expand(PRK, info, 32) -> AES Key
-        val aesKey = hkdfExpand(prk, "GhostLink-v2-AES-GCM-Key".toByteArray(Charsets.UTF_8), 32)
+        val infoBytes = transcriptInfo ?: "GhostLink-v2-Default-Transcript".toByteArray(Charsets.UTF_8)
 
-        // 3. HKDF-Expand(PRK, info, 12) -> Base IV
-        val baseIv = hkdfExpand(prk, "GhostLink-v2-Base-IV".toByteArray(Charsets.UTF_8), 12)
+        // 2. HKDF-Expand(PRK, info || "AES-GCM-Key", 32) -> AES Key
+        val aesInfo = ByteBuffer.allocate(infoBytes.size + 12)
+            .put(infoBytes)
+            .put("-AES-GCM-Key".toByteArray(Charsets.UTF_8))
+            .array()
+        val aesKey = hkdfExpand(prk, aesInfo, 32)
 
-        // 4. HKDF-Expand(PRK, info, 4) -> Session ID (uint32)
-        val sessionBytes = hkdfExpand(prk, "GhostLink-v2-Session-ID".toByteArray(Charsets.UTF_8), 4)
+        // 3. HKDF-Expand(PRK, info || "Base-IV", 12) -> Base IV
+        val ivInfo = ByteBuffer.allocate(infoBytes.size + 8)
+            .put(infoBytes)
+            .put("-Base-IV".toByteArray(Charsets.UTF_8))
+            .array()
+        val baseIv = hkdfExpand(prk, ivInfo, 12)
+
+        // 4. HKDF-Expand(PRK, info || "Session-ID", 4) -> Session ID (uint32)
+        val sidInfo = ByteBuffer.allocate(infoBytes.size + 11)
+            .put(infoBytes)
+            .put("-Session-ID".toByteArray(Charsets.UTF_8))
+            .array()
+        val sessionBytes = hkdfExpand(prk, sidInfo, 4)
         val sessionId = (ByteBuffer.wrap(sessionBytes).int.toLong() and 0xFFFFFFFFL).coerceAtLeast(1L)
 
         return SessionKeys(sessionId, aesKey, baseIv)

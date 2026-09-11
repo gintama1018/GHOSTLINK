@@ -155,6 +155,13 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
                         }
                     }
                 },
+                onFecTelemetry = { fixes, uncorrectable ->
+                    handler.post {
+                        if (fixes > 0 || uncorrectable > 0) {
+                            log("FEC: $fixes single-bit errors corrected · $uncorrectable uncorrectable")
+                        }
+                    }
+                },
                 onPacketDecoded = { packet ->
                     handler.post {
                         channelManager.onPacketReceived(packet)
@@ -440,7 +447,10 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
             // 1. ChannelManager generates ephemeral ECDH keypair and derives session keys via HKDF-SHA256
             channelManager.startSender(selectedFileName, selectedFileBytes, currentBulkChannel)
             val sessionKeys = channelManager.activeSessionKeys!!
-            log("Cryptographic keys derived: Session ID 0x${sessionKeys.sessionId.toString(16)}")
+            val sas = channelManager.sasCode ?: "N/A"
+            val secLabel = channelManager.securityLevel.label
+            log("Security: $secLabel | SAS: $sas")
+            handshakeBadge.text = "PAIRING: $secLabel (SAS: $sas)"
 
             // 2. Transmit magnetic contact pulse with this exact session seed via vibration motor
             val saltSeed = sessionKeys.baseIv.copyOf(4)
@@ -627,6 +637,9 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
     override fun onStateChanged(newState: ChannelManager.State, message: String) {
         statusText.text = "State: $newState — $message"
         log("$newState: $message")
+        if (channelManager.sasCode != null) {
+            handshakeBadge.text = "PAIRING: ${channelManager.securityLevel.label} (SAS: ${channelManager.sasCode})"
+        }
     }
 
     override fun onProgressUpdate(fraction: Float, speedBps: Double, receivedChunks: Int, totalChunks: Long) {
