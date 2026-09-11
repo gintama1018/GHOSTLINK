@@ -4,27 +4,26 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Build
+import com.ghostlink.zerorf.channels.ultrasonic.modem.AcousticFramer
+import com.ghostlink.zerorf.channels.ultrasonic.modem.AcousticMode
+import com.ghostlink.zerorf.channels.ultrasonic.modem.AcousticSynchronizer
 import com.ghostlink.zerorf.core.Packet
 import kotlin.math.PI
 import kotlin.math.cos
+import kotlin.math.log10
 
 /**
- * AudioFskDemodulator captures PCM audio and applies Goertzel frequency energy detection.
- * Matches 18,000 Hz (Space / 0) and 19,000 Hz (Mark / 1).
- * Features a bit-level sliding correlator for the 16-bit physical preamble (0xA5, 0x5A).
+ * Adaptive Multi-Mode Acoustic Demodulator.
+ * Utilizes a multi-bin Goertzel filter bank, Barker-13 cross-correlation synchronization,
+ * and empirical SNR estimation.
  */
 class AudioFskDemodulator(
-    private val onAudioEnergyUpdate: ((energy: Float) -> Unit)? = null,
+    var activeMode: AcousticMode = AcousticMode.DEFAULT_MODE,
+    private val onAudioEnergyUpdate: ((energy: Float, snrDb: Float) -> Unit)? = null,
     private val onPacketDecoded: (Packet) -> Unit
 ) {
     companion object {
-        const val SAMPLE_RATE = 44100
-        var freqSpace = 18000.0 // Hz
-        var freqMark = 19000.0  // Hz
-        const val WINDOW_SIZE = (SAMPLE_RATE * 15) / 1000 // 15 ms window = 661 samples
-
-        // 16-bit Preamble matching AudioFskModulator.PREAMBLE (0xA5, 0x5A)
-        val SYNC_BITS = intArrayOf(1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0)
+        const val SAMPLE_RATE = AcousticMode.SAMPLE_RATE
     }
 
     private var audioRecord: AudioRecord? = null
@@ -32,16 +31,23 @@ class AudioFskDemodulator(
     private var isRecording = false
     private var workerThread: Thread? = null
 
-    private var coeffSpace = 2.0 * cos(2.0 * PI * freqSpace / SAMPLE_RATE)
-    private var coeffMark = 2.0 * cos(2.0 * PI * freqMark / SAMPLE_RATE)
-
+    private val synchronizer = AcousticSynchronizer()
     private val bitBuffer = ArrayList<Int>()
 
-    fun setFrequencies(space: Double, mark: Double) {
-        freqSpace = space
-        freqMark = mark
-        coeffSpace = 2.0 * cos(2.0 * PI * freqSpace / SAMPLE_RATE)
-        coeffMark = 2.0 * cos(2.0 * PI * freqMark / SAMPLE_RATE)
+    // Precomputed Goertzel coefficients for active mode frequencies
+    private var coeffs = computeCoeffs(activeMode)
+    private var windowSize = (SAMPLE_RATE * activeMode.symbolDurationMs) / 1000
+
+    fun setMode(mode: AcousticMode) {
+        activeMode = mode
+        coeffs = computeCoeffs(mode)
+        windowSize = (SAMPLE_RATE * mode.symbolDurationMs) / 1000
+    }
+
+    private fun computeCoeffs(mode: AcousticMode): DoubleArray {
+        return DoubleArray(mode.frequenciesHz.size) { i ->
+            2.0 * cos(2.0 * PI * mode.frequenciesHz[i] / SAMPLE_RATE)
+        }
     }
 
     fun startListening() {
@@ -50,9 +56,8 @@ class AudioFskDemodulator(
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT
         )
-        val bufferSize = maxOf(minBufferSize, WINDOW_SIZE * 4)
+        val bufferSize = maxOf(minBufferSize, windowSize * 4)
 
-        // Try UNPROCESSED first (disables noise suppression filters that kill ultrasound), then VOICE_RECOGNITION, then MIC
         val sources = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             intArrayOf(
                 MediaRecorder.AudioSource.UNPROCESSED,
@@ -93,25 +98,53 @@ class AudioFskDemodulator(
         record.startRecording()
 
         workerThread = Thread {
-            val audioBuffer = ShortArray(WINDOW_SIZE)
+            val audioBuffer = ShortArray(windowSize)
             while (isRecording) {
-                val read = audioRecord?.read(audioBuffer, 0, WINDOW_SIZE) ?: 0
-                if (read == WINDOW_SIZE) {
-                    val energySpace = goertzelEnergy(audioBuffer, coeffSpace)
-                    val energyMark = goertzelEnergy(audioBuffer, coeffMark)
-                    val totalEnergy = (energySpace + energyMark).toFloat()
-
-                    onAudioEnergyUpdate?.invoke(totalEnergy)
-
-                    // Relative decision with minimum noise floor threshold
-                    val noiseFloor = 1.0e5
-                    if (energySpace > noiseFloor || energyMark > noiseFloor) {
-                        val bit = if (energyMark > energySpace) 1 else 0
-                        processBit(bit)
-                    }
+                val read = audioRecord?.read(audioBuffer, 0, windowSize) ?: 0
+                if (read == windowSize) {
+                    processAudioWindow(audioBuffer)
                 }
             }
         }.apply { start() }
+    }
+
+    private fun processAudioWindow(samples: ShortArray) {
+        val currentCoeffs = coeffs
+        val energies = DoubleArray(currentCoeffs.size) { i ->
+            goertzelEnergy(samples, currentCoeffs[i])
+        }
+
+        var maxEnergy = 0.0
+        var maxIdx = 0
+        var totalEnergy = 0.0
+        for (i in energies.indices) {
+            val e = energies[i]
+            totalEnergy += e
+            if (e > maxEnergy) {
+                maxEnergy = e
+                maxIdx = i
+            }
+        }
+
+        val noiseFloor = 1.0e5
+        val avgNoise = if (energies.size > 1) (totalEnergy - maxEnergy) / (energies.size - 1) else noiseFloor
+        val snrDb = if (avgNoise > 0 && maxEnergy > avgNoise) {
+            (10.0 * log10(maxEnergy / avgNoise)).toFloat()
+        } else 0f
+
+        onAudioEnergyUpdate?.invoke(totalEnergy.toFloat(), snrDb)
+
+        if (maxEnergy > noiseFloor && snrDb >= 2.0f) {
+            // Demodulate symbol value (0 until 2^bitsPerSymbol)
+            val bitsPerSymbol = activeMode.bitsPerSymbol
+            for (b in (bitsPerSymbol - 1) downTo 0) {
+                val bit = (maxIdx shr b) and 1
+                synchronized(bitBuffer) {
+                    bitBuffer.add(bit)
+                }
+            }
+            checkAndDecodePacket()
+        }
     }
 
     private fun goertzelEnergy(samples: ShortArray, coeff: Double): Double {
@@ -126,63 +159,59 @@ class AudioFskDemodulator(
     }
 
     @Synchronized
-    private fun processBit(bit: Int) {
-        bitBuffer.add(bit)
-
-        // Only search for packets when buffer has at least preamble + 14-byte header
-        if (bitBuffer.size >= SYNC_BITS.size + Packet.HEADER_SIZE * 8) {
-            val syncIdx = findSyncPreamble()
-            if (syncIdx != -1) {
-                val startBit = syncIdx + SYNC_BITS.size
-                val availableBits = bitBuffer.size - startBit
-                if (availableBits >= Packet.HEADER_SIZE * 8) {
-                    // Extract candidate 14-byte header
-                    val headerBytes = extractBytes(startBit, Packet.HEADER_SIZE)
-                    if (headerBytes != null) {
-                        // In 14-byte wire frame: bytes 8 and 9 are uint16 payloadLength
-                        val pLen = ((headerBytes[8].toInt() and 0xFF) shl 8) or (headerBytes[9].toInt() and 0xFF)
-                        val totalExpectedBits = (Packet.HEADER_SIZE + pLen) * 8
-
-                        if (availableBits >= totalExpectedBits) {
-                            val fullPacketBytes = extractBytes(startBit, Packet.HEADER_SIZE + pLen)
-                            if (fullPacketBytes != null) {
-                                try {
-                                    val packet = Packet.deserialize(fullPacketBytes)
-                                    onPacketDecoded(packet)
-                                    // Successfully decoded packet, advance buffer past this packet
-                                    val removeUpTo = minOf(bitBuffer.size, startBit + totalExpectedBits)
-                                    bitBuffer.subList(0, removeUpTo).clear()
-                                    return
-                                } catch (_: Exception) {
-                                    // Corrupt or false sync, advance past this sync index
-                                    bitBuffer.subList(0, syncIdx + 1).clear()
-                                }
-                            }
-                        }
-                    }
-                }
+    private fun checkAndDecodePacket() {
+        val syncIdx = synchronizer.findSyncIndex(bitBuffer)
+        if (syncIdx == -1) {
+            if (bitBuffer.size > 2048) {
+                bitBuffer.subList(0, 512).clear()
             }
+            return
         }
 
-        // Bounded ring buffer: prevent unbounded growth
-        if (bitBuffer.size > 2048) {
-            bitBuffer.subList(0, 512).clear()
+        val payloadStartBit = syncIdx + synchronizer.syncLengthBits
+        // Read 1-byte modeId (8 bits)
+        if (bitBuffer.size < payloadStartBit + 8) return
+
+        val modeByte = extractByte(payloadStartBit)
+        if (modeByte.toInt() !in 0..2) return
+        val packetStartBit = payloadStartBit + 8
+
+        // Wire format v2 header is 24 bytes (192 bits)
+        if (bitBuffer.size < packetStartBit + Packet.HEADER_SIZE * 8) return
+
+        val headerBytes = extractBytes(packetStartBit, Packet.HEADER_SIZE) ?: return
+
+        // In 24-byte wire frame: bytes 14 and 15 are uint16 payloadLength
+        val pLen = ((headerBytes[14].toInt() and 0xFF) shl 8) or (headerBytes[15].toInt() and 0xFF)
+        if (pLen > 1024) {
+            // Malformed length, discard false sync
+            bitBuffer.subList(0, syncIdx + 1).clear()
+            return
+        }
+
+        val totalExpectedBits = (Packet.HEADER_SIZE + pLen) * 8
+        if (bitBuffer.size >= packetStartBit + totalExpectedBits) {
+            val fullPacketBytes = extractBytes(packetStartBit, Packet.HEADER_SIZE + pLen)
+            if (fullPacketBytes != null) {
+                try {
+                    val packet = Packet.deserialize(fullPacketBytes)
+                    onPacketDecoded(packet)
+                    val removeUpTo = minOf(bitBuffer.size, packetStartBit + totalExpectedBits)
+                    bitBuffer.subList(0, removeUpTo).clear()
+                } catch (_: Exception) {
+                    // CRC or framing error, advance past this sync
+                    bitBuffer.subList(0, syncIdx + 1).clear()
+                }
+            }
         }
     }
 
-    private fun findSyncPreamble(): Int {
-        val limit = bitBuffer.size - SYNC_BITS.size
-        for (i in 0..limit) {
-            var match = true
-            for (j in SYNC_BITS.indices) {
-                if (bitBuffer[i + j] != SYNC_BITS[j]) {
-                    match = false
-                    break
-                }
-            }
-            if (match) return i
+    private fun extractByte(startBit: Int): Int {
+        var b = 0
+        for (i in 0 until 8) {
+            b = (b shl 1) or bitBuffer[startBit + i]
         }
-        return -1
+        return b
     }
 
     private fun extractBytes(startBit: Int, numBytes: Int): ByteArray? {

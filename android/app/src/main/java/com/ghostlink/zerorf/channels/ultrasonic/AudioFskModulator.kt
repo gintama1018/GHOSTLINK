@@ -3,31 +3,23 @@ package com.ghostlink.zerorf.channels.ultrasonic
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
+import com.ghostlink.zerorf.channels.ultrasonic.modem.AcousticFramer
+import com.ghostlink.zerorf.channels.ultrasonic.modem.AcousticMode
 import com.ghostlink.zerorf.core.Packet
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.sin
 
 /**
- * Synthesizes near-ultrasonic BFSK audio tones for fallback bulk transfer.
- * Frequencies:
- * - Bit 0 (Space): 18,000 Hz
- * - Bit 1 (Mark): 19,000 Hz
- * Symbol duration: 15 ms with 2.5 ms Hanning window pulse smoothing to prevent audible clicks.
- * Includes a 16-bit Preamble (0xA5, 0x5A) for reliable physical packet synchronization.
+ * High-performance, crash-free Acoustic Modem Modulator.
+ * Supports multi-mode FSK (BFSK, 4-FSK, 8-FSK) with Hanning window pulse smoothing.
  */
-class AudioFskModulator {
-
+class AudioFskModulator(
+    var activeMode: AcousticMode = AcousticMode.DEFAULT_MODE
+) {
     companion object {
-        const val SAMPLE_RATE = 44100
-        const val FREQ_SPACE = 18000.0 // Hz (Bit 0)
-        const val FREQ_MARK = 19000.0  // Hz (Bit 1)
-        const val SYMBOL_DURATION_MS = 15 // ms per symbol (nominal ~67 bps)
-        const val SAMPLES_PER_SYMBOL = (SAMPLE_RATE * SYMBOL_DURATION_MS) / 1000
-        const val RAMP_SAMPLES = (SAMPLE_RATE * 2.5 / 1000).toInt() // 2.5 ms taper
-
-        // 16-bit Synchronization Preamble: 0xA5, 0x5A (10100101 01011010)
-        val PREAMBLE = byteArrayOf(0xA5.toByte(), 0x5A.toByte())
+        const val SAMPLE_RATE = AcousticMode.SAMPLE_RATE
+        const val RAMP_DURATION_MS = 2.0
     }
 
     private var audioTrack: AudioTrack? = null
@@ -35,42 +27,58 @@ class AudioFskModulator {
     private var isPlaying = false
 
     /**
-     * Synthesizes 16-bit PCM audio samples for preamble + packet's binary wire data.
+     * Synthesizes 16-bit PCM samples for a packet under activeMode.
      */
     fun synthesizePcm(packet: Packet): ShortArray {
-        val wireBytes = packet.serialize()
-        val totalBytes = ByteArray(PREAMBLE.size + wireBytes.size)
-        System.arraycopy(PREAMBLE, 0, totalBytes, 0, PREAMBLE.size)
-        System.arraycopy(wireBytes, 0, totalBytes, PREAMBLE.size, wireBytes.size)
+        val frameBytes = AcousticFramer.framePacket(packet, activeMode)
+        val mode = activeMode
+        val symbolDurationMs = mode.symbolDurationMs
+        val samplesPerSymbol = (SAMPLE_RATE * symbolDurationMs) / 1000
+        val rampSamples = (SAMPLE_RATE * RAMP_DURATION_MS / 1000).toInt()
+        val bitsPerSymbol = mode.bitsPerSymbol
+        val freqs = mode.frequenciesHz
 
-        val totalBits = totalBytes.size * 8
-        val totalSamples = totalBits * SAMPLES_PER_SYMBOL
+        val totalBits = frameBytes.size * 8
+        val totalSymbols = (totalBits + bitsPerSymbol - 1) / bitsPerSymbol
+        val totalSamples = totalSymbols * samplesPerSymbol
         val pcm = ShortArray(totalSamples)
 
         var sampleIdx = 0
         var phase = 0.0
 
-        for (b in totalBytes) {
-            for (bitOffset in 7 downTo 0) {
-                val bit = ((b.toInt() and 0xFF) shr bitOffset) and 1
-                val targetFreq = if (bit == 1) FREQ_MARK else FREQ_SPACE
-                val phaseIncrement = 2.0 * PI * targetFreq / SAMPLE_RATE
+        // Extract symbols (bitsPerSymbol bits per step)
+        var bitOffset = 0
+        for (sIdx in 0 until totalSymbols) {
+            var symbolValue = 0
+            for (b in 0 until bitsPerSymbol) {
+                val currentBitIdx = bitOffset + b
+                val byteIdx = currentBitIdx / 8
+                val bitInByte = 7 - (currentBitIdx % 8)
+                val bit = if (byteIdx < frameBytes.size) {
+                    ((frameBytes[byteIdx].toInt() and 0xFF) shr bitInByte) and 1
+                } else 0
+                symbolValue = (symbolValue shl 1) or bit
+            }
+            bitOffset += bitsPerSymbol
 
-                for (s in 0 until SAMPLES_PER_SYMBOL) {
-                    // Hanning window smoothing on edges to prevent clicks
-                    var envelope = 1.0
-                    if (s < RAMP_SAMPLES) {
-                        envelope = 0.5 * (1.0 - cos(PI * s / RAMP_SAMPLES))
-                    } else if (s > SAMPLES_PER_SYMBOL - RAMP_SAMPLES) {
-                        val remaining = SAMPLES_PER_SYMBOL - s
-                        envelope = 0.5 * (1.0 - cos(PI * remaining / RAMP_SAMPLES))
-                    }
+            val targetFreq = freqs[symbolValue.coerceIn(0, freqs.size - 1)]
+            val phaseIncrement = 2.0 * PI * targetFreq / SAMPLE_RATE
 
-                    val sampleVal = (sin(phase) * envelope * 30000.0).toInt().coerceIn(-32768, 32767)
-                    pcm[sampleIdx++] = sampleVal.toShort()
-                    phase += phaseIncrement
-                    if (phase > 2.0 * PI) phase -= 2.0 * PI
+            for (s in 0 until samplesPerSymbol) {
+                var envelope = 1.0
+                if (s < rampSamples) {
+                    envelope = 0.5 * (1.0 - cos(PI * s / rampSamples))
+                } else if (s > samplesPerSymbol - rampSamples) {
+                    val remaining = samplesPerSymbol - s
+                    envelope = 0.5 * (1.0 - cos(PI * remaining / rampSamples))
                 }
+
+                val sampleVal = (sin(phase) * envelope * 28000.0).toInt().coerceIn(-32768, 32767)
+                if (sampleIdx < pcm.size) {
+                    pcm[sampleIdx++] = sampleVal.toShort()
+                }
+                phase += phaseIncrement
+                if (phase > 2.0 * PI) phase -= 2.0 * PI
             }
         }
         return pcm
@@ -114,8 +122,7 @@ class AudioFskModulator {
     }
 
     /**
-     * Plays packet's tone burst synchronously so each packet plays completely
-     * without being cut off, and without allocating/destroying native tracks in a tight loop.
+     * Plays tone burst synchronously and yields execution until the frame completes.
      */
     fun playPacket(packet: Packet) {
         val pcm = synthesizePcm(packet)
@@ -125,9 +132,8 @@ class AudioFskModulator {
             val track = getOrCreateAudioTrack(pcm.size)
             track.write(pcm, 0, pcm.size)
 
-            // Block caller thread until the entire tone burst has completed playback
             val durationMs = (pcm.size * 1000L) / SAMPLE_RATE
-            Thread.sleep(durationMs + 150L) // Packet duration + 150ms inter-burst guard gap
+            Thread.sleep(durationMs + 100L) // Packet duration + 100ms guard interval
         } catch (_: InterruptedException) {
             // Cancelled
         } catch (_: Exception) {}

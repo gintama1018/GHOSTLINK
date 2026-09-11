@@ -28,6 +28,7 @@ import com.ghostlink.zerorf.channels.optical.QrFrameDecoder
 import com.ghostlink.zerorf.channels.optical.QrFrameEncoder
 import com.ghostlink.zerorf.channels.ultrasonic.AudioFskDemodulator
 import com.ghostlink.zerorf.channels.ultrasonic.AudioFskModulator
+import com.ghostlink.zerorf.core.SafeFileStorage
 import com.ghostlink.zerorf.manager.ChannelManager
 import com.ghostlink.zerorf.manager.TransparentEta
 import java.io.File
@@ -146,11 +147,11 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
             audioModulator = AudioFskModulator()
 
             audioDemodulator = AudioFskDemodulator(
-                onAudioEnergyUpdate = { energy ->
+                onAudioEnergyUpdate = { energy, snrDb ->
                     handler.post {
                         if (scopeView.visibility == View.VISIBLE && currentBulkChannel == ChannelManager.BulkChannel.ULTRASONIC) {
                             val db = if (energy > 1.0) (10 * log10(energy.toDouble())).toFloat() else 0f
-                            scopeView.pushSample(db * 0.8f, "${db.format(1)} dB (18.5 kHz)")
+                            scopeView.pushSample(db * 0.8f, "${db.format(1)} dB · SNR: ${snrDb.format(1)} dB")
                         }
                     }
                 },
@@ -436,15 +437,16 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
 
             log("Initiating transmission: $selectedFileName (${selectedFileBytes.size} bytes) via $currentBulkChannel...")
 
-            // 1. ChannelManager generates fresh per-session SecureRandom seed and encrypts with AES-GCM
+            // 1. ChannelManager generates ephemeral ECDH keypair and derives session keys via HKDF-SHA256
             channelManager.startSender(selectedFileName, selectedFileBytes, currentBulkChannel)
-            val sessionSeed = channelManager.activeSessionSeed!!
-            log("Cryptographic seed generated: 0x${sessionSeed.joinToString("") { "%02x".format(it) }}")
+            val sessionKeys = channelManager.activeSessionKeys!!
+            log("Cryptographic keys derived: Session ID 0x${sessionKeys.sessionId.toString(16)}")
 
-            // 2. Transmit magnetic contact pulse with this exact fresh seed via vibration motor
-            val hsPacket = MagneticPacket.create(0x11, sessionSeed)
+            // 2. Transmit magnetic contact pulse with this exact session seed via vibration motor
+            val saltSeed = sessionKeys.baseIv.copyOf(4)
+            val hsPacket = MagneticPacket.create(0x11, saltSeed)
             vibrationTransmitter.transmit(hsPacket)
-            log("Vibrating motor with 8-byte pairing token (contact <2cm)...")
+            log("Vibrating motor with 4-byte pairing token (contact <2cm)...")
 
             // 3. Start bulk transmission
             when (currentBulkChannel) {
@@ -643,25 +645,25 @@ class MainActivity : AppCompatActivity(), ChannelManager.ChannelEventListener {
         stopCamera()
         log("SUCCESS: Received $fileName (${fileBytes.size} bytes). Verifying...")
 
-        // Robust file saving compatible with Android 8 through 15
+        // Robust file saving compatible with Android 8 through 15 with Path Traversal (CWE-22) defense
         try {
-            val targetDir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: filesDir
-            val ghostLinkDir = File(targetDir, "GhostLink").apply { if (!exists()) mkdirs() }
-            val targetFile = File(ghostLinkDir, fileName)
-            FileOutputStream(targetFile).use { it.write(fileBytes) }
+            val baseDir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: filesDir
+            val ghostLinkDir = File(baseDir, "GhostLink").apply { if (!exists()) mkdirs() }
+            val targetFile = SafeFileStorage.getSafeTargetFile(ghostLinkDir, fileName)
+            SafeFileStorage.writeBytesAtomically(targetFile, fileBytes)
 
-            log("Saved to: ${targetFile.absolutePath}")
-            Toast.makeText(this, "Received & Saved: $fileName!", Toast.LENGTH_LONG).show()
+            log("Saved safely to: ${targetFile.canonicalPath}")
+            Toast.makeText(this, "Received & Saved: ${targetFile.name}!", Toast.LENGTH_LONG).show()
 
             // Display content if text/ascii
             val isText = fileBytes.all { it in 9..126 || it == 10.toByte() || it == 13.toByte() }
             if (isText) {
-                decryptedOutputText.text = "FILE: $fileName (${fileBytes.size} B)\n\n" + String(fileBytes, Charsets.UTF_8)
+                decryptedOutputText.text = "FILE: ${targetFile.name} (${fileBytes.size} B)\n\n" + String(fileBytes, Charsets.UTF_8)
             } else {
-                decryptedOutputText.text = "BINARY FILE RECEIVED & SAVED:\nName: $fileName\nSize: ${fileBytes.size} bytes\nPath: ${targetFile.absolutePath}"
+                decryptedOutputText.text = "BINARY FILE RECEIVED & SAVED:\nName: ${targetFile.name}\nSize: ${fileBytes.size} bytes\nPath: ${targetFile.canonicalPath}"
             }
         } catch (e: Exception) {
-            log("Save fallback error: ${e.message}")
+            log("Save error: ${e.message}")
             decryptedOutputText.text = "Received $fileName (${fileBytes.size} bytes). Error saving file: ${e.message}"
         }
 
